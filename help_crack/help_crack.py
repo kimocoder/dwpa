@@ -1,551 +1,912 @@
-#!/usr/bin/python2.7
-# The source code is distributed under GPLv3+ license
-# author: Alex Stanev, alex at stanev dot org
-# web: http://wpa-sec.stanev.org
+#!/usr/bin/env python
+'''Clientside part of dwpa distributed cracker
+The source code is distributed under GPLv3+ license
+author: Alex Stanev, alex at stanev dot org
+web: https://wpa-sec.stanev.org'''
 
+from __future__ import print_function
+import argparse
 import sys
 import os
 import platform
 import subprocess
 import shlex
 import stat
-import urllib
 import hashlib
+import zlib
 import gzip
 import re
 import time
-import StringIO
 import json
-import base64
+import binascii
+import struct
 from distutils.version import StrictVersion
+from functools import partial
 
-#some base variables
-base_url = 'http://wpa-sec.stanev.org/'
-help_crack = base_url + 'hc/help_crack.py'
-help_crack_cl = base_url + 'hc/CHANGELOG'
-get_work_url = base_url + '?get_work'
-put_work_url = base_url + '?put_work'
-res_file = 'help_crack.res'
-net_file = 'help_crack.net'
-key_file = 'help_crack.key'
+try:
+    from urllib import urlretrieve
+    from urllib import urlopen
+    from urllib import urlencode
+except ImportError:
+    from urllib.parse import urlencode
+    from urllib.request import urlopen, urlretrieve
 
-#version
-hc_ver = '0.8.8'
+try:
+    from string import maketrans
+except ImportError:
+    maketrans = bytearray.maketrans  # pylint: disable=no-member
 
-#decompression block size 64k
-blocksize = 1 << 16
+try:
+    userinput = raw_input
+except NameError:
+    userinput = input
 
-#ANSI color codes
-#empty for win
-if os.name != 'nt':
-    cc = {'HEADER':  '\033[95m',
-          'OKBLUE':  '\033[94m',
-          'OKGREEN': '\033[92m',
-          'WARNING': '\033[93m',
-          'FAIL':    '\033[91m',
-          'ENDC':    '\033[0m'}
-else:
-    cc = {'HEADER':  '',
-          'OKBLUE':  '',
-          'OKGREEN': '',
-          'WARNING': '',
-          'FAIL':    '',
-          'ENDC':    ''}
+#configuration
+conf = {
+    'base_url': 'https://wpa-sec.stanev.org/',
+    'res_file': 'help_crack.res',
+    'hccapx_file': 'help_crack.hccapx',
+    'pmkid_file': 'help_crack.pmkid',
+    'key_file': 'help_crack.key',
+    'additional': None,
+    'custom': None,
+    'format': None,
+    'potfile': None,
+    'cracker': '',
+    'coptions': '',
+    'dictcount': 1,
+    'autodictcount': True,
+    'hc_ver': '1.1.0'
+}
+conf['help_crack'] = conf['base_url'] + 'hc/help_crack.py'
+conf['help_crack_cl'] = conf['base_url'] + 'hc/CHANGELOG'
+conf['get_work_url'] = conf['base_url'] + '?get_work'
+conf['put_work_url'] = conf['base_url'] + '?put_work'
 
-def sleepy():
-    print cc['WARNING'] + 'Sleeping...' + cc['ENDC']
-    time.sleep(222)
 
-#validate bssid/mac address
-def valid_mac(mac):
-    if len(mac) != 17:
-        return False
-    if not re.match(r'^([a-f0-9]{2}\:?){6}$', mac):
-        return False
-    return True
+class HelpCrack(object):
+    '''Main helpcrack class'''
+    # decompression block size 64k
+    blocksize = 1 << 16
+    conf = None
 
-#get md5 from local file
-def md5file(filename):
-    md5s = hashlib.md5()
-    try:
-        with open(filename, 'rb') as f:
-            for chunk in iter(lambda: f.read(blocksize), ''):
-                md5s.update(chunk)
-    except Exception as e:
-        print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-        return None
+    def __init__(self, c=None):
+        self.conf = c
 
-    return md5s.hexdigest()
+    @staticmethod
+    def pprint(mess, code='HEADER'):
+        '''pretty print'''
+        if os.name == 'nt':
+            print(mess)
+        else:
+            cc = {'HEADER':  '\033[95m',
+                  'OKBLUE':  '\033[94m',
+                  'OKGREEN': '\033[92m',
+                  'WARNING': '\033[93m',
+                  'FAIL':    '\033[91m',
+                  'ENDC':    '\033[0m'}
+            print(cc[code] + mess + cc['ENDC'])
 
-#download remote file
-def download(url, filename):
-    try:
-        urllib.urlretrieve(url, filename)
-    except Exception as e:
-        print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-        return False
+    def sleepy(self, sec=222):
+        '''wait for calm down'''
+        self.pprint('Sleeping...', 'WARNING')
+        try:
+            time.sleep(sec)
+        except KeyboardInterrupt:
+            self.pprint('\nKeyboard interrupt', 'OKBLUE')
+            exit(0)
 
-    return True
+    @staticmethod
+    def valid_mac(mac):
+        '''validate bssid/mac address'''
+        if len(mac) != 17:
+            return False
+        if not re.match(r'^([a-f0-9]{2}\:?){6}$', mac):
+            return False
+        return True
 
-#get remote content and return it in var
-def get_url(url, options=None):
-    try:
-        response = urllib.urlopen(url, urllib.urlencode({'options': options}))
-    except Exception as e:
-        print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-        return None
-    remote = response.read()
-    response.close()
+    def md5file(self, filename):
+        '''compute md5 over local file'''
+        md5 = hashlib.md5()
+        try:
+            with open(filename, 'rb') as fd:
+                for chunk in iter(partial(fd.read, self.blocksize), b''):
+                    if not chunk:
+                        break
+                    md5.update(chunk)
+        except OSError as e:
+            self.pprint('Exception: {0}'.format(e), 'FAIL')
+            return None
 
-    return remote
+        return md5.hexdigest()
 
-#get md5 of current script, compare it with remote and initiate update
-def check_version():
-    remoteversion = get_url(help_crack+'.version')
-    if not remoteversion:
-        print cc['WARNING'] + 'Can\'t check for new version, continue...' + cc['ENDC']
-        return
-
-    if StrictVersion(remoteversion) > StrictVersion(hc_ver):
+    def download(self, url, filename):
+        '''download remote file'''
         while True:
-            user = raw_input(cc['HEADER'] + 'New version ' + remoteversion + ' of help_crack found. Update[y] or Show changelog[c]:' + cc['ENDC'])
-            if user == 'c':
-                print get_url(help_crack_cl)
-                continue
-            if user == 'y' or user == '':
-                if download(help_crack, sys.argv[0]+'.new'):
-                    try:
-                        os.rename(sys.argv[0]+'.new', sys.argv[0])
-                        os.chmod(sys.argv[0], stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
-                    except Exception as e:
-                        print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-                        #TODO: think of workaround locking on win32
-                        if os.name == 'nt':
-                            print cc['OKBLUE'] + 'You are running under win32, rename help_crack.py.new over help_crack.py' + cc['ENDC']
-                    print cc['OKGREEN'] + 'help_crack updated, run again' + cc['ENDC']
+            try:
+                urlretrieve(url, filename)
+                return True
+            except IOError as e:
+                self.pprint('Exception: {0}'.format(e), 'FAIL')
+                self.sleepy()
+
+    def get_url(self, url, options=None):
+        '''get remote content and return it in var'''
+        try:
+            data = urlencode({'options': options}).encode()
+            response = urlopen(url, data)
+        except IOError as e:
+            self.pprint('Exception: {0}'.format(e), 'WARNING')
+            return None
+        remote = response.read()
+        response.close()
+
+        return remote.decode()
+
+    def check_version(self):
+        '''compare version and initiate update'''
+        remoteversion = self.get_url(self.conf['help_crack']+'.version')
+        if not remoteversion:
+            self.pprint('Can\'t check for new version, continue...', 'WARNING')
+            return
+
+        if StrictVersion(remoteversion) > StrictVersion(self.conf['hc_ver']):
+            while True:
+                self.pprint('New version ' + remoteversion + ' of help_crack found.')
+                user = userinput('Update[y] or Show changelog[c]:')
+                if user == 'c':
+                    self.pprint(self.get_url(self.conf['help_crack_cl']))
+                    continue
+                if user == 'y' or user == '':
+                    if self.download(self.conf['help_crack'], sys.argv[0]+'.new'):
+                        try:
+                            os.rename(sys.argv[0]+'.new', sys.argv[0])
+                            os.chmod(sys.argv[0], stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
+                        except OSError as e:
+                            self.pprint('Exception: {0}'.format(e), 'FAIL')
+                            # TODO: think of workaround locking on win32
+                            if os.name == 'nt':
+                                self.pprint('You are running under win32, rename help_crack.py.new over help_crack.py', 'OKBLUE')
+                        self.pprint('help_crack updated, run again', 'OKGREEN')
+                        exit(0)
+                    else:
+                        self.pprint('help_crack update failed', 'FAIL')
+                        return
+
+                return
+
+    def check_tools(self):
+        '''look for cracking tools, check for their capabilities, ask user'''
+
+        def which(program):
+            '''find executable in current dir or in PATH env var'''
+            def is_exe(fpath):
+                '''check if file exists and is executable'''
+                return os.path.exists(fpath) and os.access(fpath, os.X_OK)
+
+            if os.name == 'nt':
+                program += '.exe'
+                if os.path.exists(program):
+                    return program
+
+            fpath = os.path.split(program)[0]
+            if fpath:
+                if is_exe(program):
+                    return program
+            else:
+                for path in os.environ['PATH'].split(os.pathsep):
+                    exe_file = os.path.join(path, program)
+                    if is_exe(exe_file):
+                        return exe_file
+                if os.name == 'posix' and is_exe(program):
+                    return './' + program
+
+            return False
+
+        def run_hashcat(tl):
+            '''check hashcat version'''
+            def _run_hashcat(tool):
+                '''execute and check version'''
+                try:
+                    acp = subprocess.Popen(shlex.split(tool + ' -V'), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    output = acp.communicate()[0]
+                except OSError:
+                    return False
+
+                output = re.sub(r'[^\d\.]', '', output.decode())
+                try:
+                    if StrictVersion(output) >= StrictVersion('4.2.1'):
+                        return True
+                except ValueError as e:
+                    self.pprint('Unsupported hashcat version', 'FAIL')
+                    self.pprint('Exception: {0}'.format(e), 'FAIL')
+                    exit(1)
+
+                return False
+
+            tools = []
+            for xt in tl:
+                t = which(xt)
+                if t and _run_hashcat(t):
+                    tools.append(t)
+
+            return tools
+
+        def run_jtr():
+            '''check JtR capabilities'''
+            def _run_jtr(tool):
+                '''execute and check'''
+                try:
+                    acp = subprocess.Popen(shlex.split(tool), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    output = acp.communicate()[0]
+                except OSError:
+                    return False
+
+                if output.find(b'PASS') != -1 and output.find(b'PMKID') != -1:
+                    return True
+
+                return False
+
+            tools = []
+            t = which('john')
+            if t:
+                if _run_jtr(t + ' --format=wpapsk --test=0'):
+                    tools.append(t + ' --format=wpapsk')
+                if _run_jtr(t + ' --format=wpapsk-opencl --test=0'):
+                    tools.append(t + ' --format=wpapsk-opencl')
+                if _run_jtr(t + ' --format=wpapsk-cuda --test=0'):
+                    tools.append(t + ' --format=wpapsk-cuda')
+
+            return tools
+
+        def set_format(tool):
+            '''sets format based on selected tool'''
+            self.conf['cracker'] = tool
+            if tool.find('hashcat') != -1:
+                self.conf['format'] = 'hccapx'
+            else:
+                self.conf['format'] = 'wpapsk'
+            return
+
+        tools = []
+
+        # hashcat
+        bits = platform.architecture()[0]
+        if bits == '64bit':
+            tools += run_hashcat(['hashcat64.bin', 'hashcat64', 'hashcat'])
+        else:
+            tools += run_hashcat(['hashcat32.bin', 'hashcat32', 'hashcat'])
+
+        # John the Ripper
+        tools += run_jtr()
+
+        if not tools:
+            self.pprint('hashcat or john not found', 'FAIL')
+            exit(1)
+        if len(tools) == 1:
+            set_format(tools[0])
+            return tools[0]
+
+        self.pprint('Choose the tool for cracking:')
+        for index, ttool in enumerate(tools):
+            print('{0}: {1}'.format(index, ttool))
+        print('9: Quit')
+        while True:
+            user = userinput('Index:')
+            if user == '9':
+                exit(0)
+            try:
+                set_format(tools[int(user)])
+                return tools[int(user)]
+            except (ValueError, IndexError):
+                self.pprint('Wrong index', 'WARNING')
+
+    @staticmethod
+    def hccapx2john(hccapx):
+        '''convert hccapx struct to JtR $WPAPSK$ and implement nonce correction
+            hccap:  https://hashcat.net/wiki/doku.php?id=hccap
+            hccapx: https://hashcat.net/wiki/doku.php?id=hccapx
+            JtR:    https://github.com/magnumripper/JohnTheRipper/blob/bleeding-jumbo/src/wpapcap2john.c
+        '''
+
+        def pack_jtr(hccap, message_pair, ncorr=0):
+            '''prepare handshake in JtR format'''
+            jtr = b'%s:$WPAPSK$%s#%s:%s:%s:%s::%s:%s:/dev/null\n'
+            hccap_fmt = '< 36s 6s 6s 32x 28x 4s 256x 4x I 16x'
+
+            (essid, mac_ap, mac_sta, corr, keyver) = struct.unpack(hccap_fmt, hccap)
+
+            # replay count checked
+            if message_pair & 0x80 > 1:
+                ver = b'verified'
+            else:
+                ver = b'not verified'
+
+            # detect endian and apply nonce correction
+            if ncorr != 0:
+                try:
+                    if message_pair & 0x40 > 1:
+                        ver += b', fuzz ' + str(ncorr).encode() + b' BE'
+                        dcorr = struct.unpack('>L', corr)[0]
+                        corr = struct.pack('>L', dcorr + ncorr)
+                    if message_pair & 0x20 > 1:
+                        ver += b', fuzz ' + str(ncorr).encode() + b' LE'
+                        dcorr = struct.unpack('<L', corr)[0]
+                        corr = struct.pack('<L', dcorr + ncorr)
+                except struct.error:
+                    pass
+
+            # cut essid part and stuff correction
+            newhccap = hccap[36:108] + corr + hccap[112:]
+
+            # prepare values for JtR
+            essid = essid.rstrip(b'\0')
+            mac_sta = binascii.hexlify(mac_sta)
+            mac_ap = binascii.hexlify(mac_ap)
+
+            if keyver == 1:
+                keyver = b'WPA'
+            elif keyver == 2:
+                keyver = b'WPA2'
+            elif keyver >= 3:
+                keyver = b'WPA CMAC'
+
+            # prepare translation to base64 alphabet used by JtR
+            encode_trans = maketrans(b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',
+                                     b'./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')
+
+            return jtr % (essid,
+                          essid,
+                          binascii.b2a_base64(newhccap).translate(encode_trans).rstrip(b'=\r\n'),
+                          mac_sta,
+                          mac_ap,
+                          mac_ap,
+                          keyver,
+                          ver)
+
+        def hccapx2hccap(hccapx):
+            '''convert hccapx to hccap struct'''
+            hccapx_fmt = '< 4x 4x B x 32s B 16s 6s 32s 6s 32s H 256s'
+            hccap_fmt = '< 36s 6s 6s 32s 32s 256s I I 16s'
+
+            (message_pair,
+             essid,
+             keyver, keymic,
+             mac_ap, nonce_ap, mac_sta, nonce_sta,
+             eapol_len, eapol) = struct.unpack(hccapx_fmt, hccapx)
+
+            hccap = struct.pack(
+                hccap_fmt,
+                essid,
+                mac_ap, mac_sta,
+                nonce_sta, nonce_ap,
+                eapol, eapol_len,
+                keyver, keymic)
+
+            return (hccap, message_pair)
+
+        hccapx = bytearray(hccapx)
+
+        # convert hccapx to hccap and extract message_pair
+        (hccap, message_pair) = hccapx2hccap(hccapx)
+
+        # exact handshake
+        hccaps = pack_jtr(hccap, message_pair)
+        if message_pair & 0x10 > 1:
+            return hccaps
+
+        # detect if we have endianness info
+        flip = False
+        if message_pair & 0x60 == 0:
+            flip = True
+            # set flag for LE
+            message_pair |= 0x20
+
+        # prepare nonce correction
+        for i in range(1, 129):
+            if flip:
+                # this comes with LE set first time if we don't have endianness info
+                hccaps += pack_jtr(hccap, message_pair, i)
+                hccaps += pack_jtr(hccap, message_pair, -i)
+                # toggle BE/LE bits
+                message_pair ^= 0x60
+
+            hccaps += pack_jtr(hccap, message_pair, i)
+            hccaps += pack_jtr(hccap, message_pair, -i)
+
+        return hccaps
+
+    def get_work(self, options):
+        '''pull handshakes and optionally dictionary location/ssid'''
+        while True:
+            work = self.get_url(self.conf['get_work_url']+'='+self.conf['hc_ver'], options)
+            try:
+                netdata = json.loads(work)
+                if not (any('ssid' in d for d in netdata) or any('hkey' in d for d in netdata)):
+                    raise ValueError
+
+                return netdata
+            except (TypeError, ValueError, KeyError):
+                if work == 'Version':
+                    self.pprint('Please update help_crack, the API has changed', 'FAIL')
+                    exit(1)
+                if 'ssid' in options and work == 'No nets':
+                    self.pprint('User dictionary check finished', 'OKGREEN')
                     exit(0)
-                else:
-                    print cc['FAIL'] + 'help_crack update failed' + cc['ENDC']
-                    return
+                if work == 'No nets':
+                    self.pprint('No suitable nets found', 'WARNING')
+                    self.sleepy()
+                    continue
+
+            self.pprint('Server response error', 'WARNING')
+            self.sleepy()
+
+    def prepare_work(self, netdata):
+        '''prepare work based on netdata; returns ssid/hkey'''
+        if netdata is None:
+            return False
+
+        # cleanup
+        if os.path.exists(self.conf['hccapx_file']):
+            os.unlink(self.conf['hccapx_file'])
+        if os.path.exists(self.conf['pmkid_file']):
+            os.unlink(self.conf['pmkid_file'])
+
+        # extract ssid/hkey and handshakes
+        metadata = {}
+        try:
+            for part in netdata:
+                if 'hkey' in part:
+                    metadata['hkey'] = part['hkey']
+                if 'ssid' in part:
+                    metadata['ssid'] = part['ssid']
+                if 'hccapx' in part:
+                    with open(self.conf['hccapx_file'], 'ab') as fd:
+                        if self.conf['format'] == 'hccapx':
+                            fd.write(binascii.a2b_base64(part['hccapx']))
+                        else:
+                            fd.write(self.hccapx2john(binascii.a2b_base64(part['hccapx'])))
+                if 'pmkid' in part:
+                    if self.conf['format'] == 'hccapx':
+                        with open(self.conf['pmkid_file'], 'ab') as fd:
+                            fd.write(str(part['pmkid']).encode() + b'\n')
+                    else:
+                        with open(self.conf['hccapx_file'], 'ab') as fd:
+                            fd.write(str(part['pmkid']).encode() + b'\n')
+
+            if not (any('ssid' in d for d in netdata) or any('hkey' in d for d in netdata)):
+                self.pprint('hkey or ssid not found in work package!', 'FAIL')
+                exit(1)
+        except OSError as e:
+            self.pprint('Handshake write failed', 'FAIL')
+            self.pprint('Exception: {0}'.format(e), 'FAIL')
+            exit(1)
+
+        return metadata
+
+    def prepare_dicts(self, netdata):
+        '''download and check dictionaries'''
+        # pull dicts info from netdata
+        dicts = list()
+        dlist = list()
+        dhash = ''
+        dpath = ''
+        for part in netdata:
+            if 'dhash' in part:
+                dhash = part['dhash']
+            if 'dpath' in part:
+                dpath = part['dpath']
+            if 'dicts' in part:
+                for dpart in part['dicts']:
+                    #print(dpart)
+                    dicts.append({'dhash': dpart['dhash'], 'dpath': dpart['dpath']})
+        if dhash != '' and dpath != '':
+            dicts.append({'dhash': dhash, 'dpath': dpath})
+
+        # download and check
+        for d in dicts:
+            dictmd5 = ''
+            extract = False
+            gzdictname = d['dpath'].split('/')[-1]
+            dictname = gzdictname.rsplit('.', 1)[0]
+            dlist.append(dictname)
+
+            while True:
+                if os.path.exists(gzdictname):
+                    dictmd5 = self.md5file(gzdictname)
+                if d['dhash'] != dictmd5:
+                    self.pprint('Downloading {0}'.format(gzdictname), 'OKBLUE')
+                    self.download(d['dpath'], gzdictname)
+                    if self.md5file(gzdictname) != d['dhash']:
+                        self.pprint('{0} downloaded but hash mismatch'.format(gzdictname), 'WARNING')
+
+                    extract = True
+
+                if not os.path.exists(dictname):
+                    extract = True
+
+                if extract:
+                    self.pprint('Extracting {0}'.format(gzdictname), 'OKBLUE')
+                    try:
+                        with gzip.open(gzdictname, 'rb') as ftgz:
+                            with open(dictname, 'wb') as fd:
+                                while True:
+                                    chunk = ftgz.read(self.blocksize)
+                                    if not chunk:
+                                        break
+                                    fd.write(chunk)
+                    except (IOError, OSError, EOFError, zlib.error) as e:
+                        self.pprint('{0} extraction failed'.format(gzdictname), 'FAIL')
+                        self.pprint('Exception: {0}'.format(e), 'FAIL')
+                        self.sleepy()
+                        continue
+                break
+
+        return dlist
+
+    def prepare_challenge(self):
+        '''prepare challenge with known PSK'''
+        netdata = [{'hccapx': """SENQWAQAAAAABWRsaW5rAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAiaaYe8l4TWktCODLsTs\
+                                x/QcfuXi8tDb0kmj6c7GztM2D7o/rpukqm7Gx2EFeW/2taIJ0YeCygAmxy5JAGRbH2hKJWbiEmbx\
+                                I6vDhsxXb1k+bcXjgjoy+9Svkp9RewABAwB3AgEKAAAAAAAAAAAAAGRbH2hKJWbiEmbxI6vDhsxX\
+                                b1k+bcXjgjoy+9Svkp9RAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+                                AAAAAAAAABgwFgEAAA+sAgEAAA+sBAEAAA+sAjwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+                                AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+                                AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA""",
+                    'pmkid': '8ac36b891edca8eef49094b1afe061ac*1c7ee5e2f2d0*0026c72e4900*646c696e6b',
+                    'key': 'aaaa1234',
+                    'dictname': 'challenge.txt'},
+                   {'ssid': ''}]
+        try:
+            # create dict
+            try:
+                data = netdata[0]['key'] + "\n"
+                with open(netdata[0]['dictname'], 'wb') as fd:
+                    fd.write(data.encode())
+            except OSError as e:
+                self.pprint(netdata[0]['dictname'] + ' creation failed', 'FAIL')
+                self.pprint('Exception: {0}'.format(e), 'FAIL')
+                exit(1)
+
+            # clean old keyfile
+            if os.path.exists(self.conf['key_file']):
+                os.unlink(self.conf['key_file'])
+
+            return netdata
+        except TypeError as e:
+            self.pprint('Couldn\'t prepare challenge', 'FAIL')
+            self.pprint('Exception: {0}'.format(e), 'FAIL')
+            exit(1)
+
+    def put_work(self, metadata, keypair):
+        '''return results to server'''
+        keys = {}
+        if 'hkey' in metadata:
+            keys['hkey'] = metadata['hkey']
+        if keypair is not None:
+            for pad, k in enumerate(keypair):
+                keys[(b'z%03d' % pad) + k['bssid']] = k['key']
+        data = urlencode(keys).encode()
+        while True:
+            try:
+                response = urlopen(self.conf['put_work_url'], data)
+                response.close()
+                return True
+            except IOError as e:
+                self.pprint('Couldn\'t submit key', 'WARNING')
+                self.pprint('Exception: {0}'.format(e), 'WARNING')
+                self.sleepy(10)
+
+    def create_resume(self, netdata):
+        '''create resume file'''
+        with open(self.conf['res_file'], 'w') as fd:
+            json.dump(netdata, fd)
+
+    def resume_check(self):
+        '''check for resume files'''
+        if os.path.exists(self.conf['res_file']):
+            with open(self.conf['res_file']) as fd:
+                try:
+                    netdata = json.load(fd)
+                    if not (any('ssid' in d for d in netdata) or any('hkey' in d for d in netdata)):
+                        raise ValueError
+                    if not any('hkey' in d for d in netdata) and self.conf['custom'] is None:
+                        self.pprint('Can\'t resume from custom dictionary attack', 'WARNING')
+                        return None
+                    if any('hkey' in d for d in netdata) and self.conf['custom'] is not None:
+                        self.pprint('Can\'t resume from classic aatack to custom dictionary', 'WARNING')
+                        return None
+                    self.pprint('Session resume', 'OKBLUE')
+                    return netdata
+                except (TypeError, ValueError, KeyError):
+                    self.pprint('Bad resume file contents', 'WARNING')
+                    os.unlink(self.conf['res_file'])
+
+        return None
+
+    def run_cracker(self, dictlist, disablestdout=False):
+        '''run externel cracker process'''
+        fd = None
+        if disablestdout:
+            fd = open(os.devnull, 'w')
+
+        while True:
+            try:
+                # TODO: fix this code duplication
+                if self.conf['format'] == 'hccapx':
+                    if os.path.exists(self.conf['pmkid_file']):
+                        cracker = '{0} -m16800 --logfile-disable --potfile-disable {1} -o{2} {3}'.format(self.conf['cracker'], self.conf['coptions'], self.conf['key_file'], self.conf['pmkid_file'])
+                        for dn in dictlist:
+                            cracker = ''.join([cracker, ' ', dn])
+                        rc = subprocess.call(shlex.split(cracker), stdout=fd)
+                        if rc == -2:
+                            self.pprint('Thermal watchdog barked', 'WARNING')
+                            self.sleepy()
+                            continue
+                        if rc >= 2 or rc == -1:
+                            self.pprint('hashcat {0} died with code {1}'.format(self.conf['cracker'], rc), 'FAIL')
+                            self.pprint('Check you have OpenCL support', 'FAIL')
+                            exit(1)
+
+                    if os.path.exists(self.conf['hccapx_file']):
+                        cracker = '{0} -m2500 --nonce-error-corrections=128 --logfile-disable --potfile-disable {1} -o{2} {3}'.format(self.conf['cracker'], self.conf['coptions'], self.conf['key_file'], self.conf['hccapx_file'])
+                        for dn in dictlist:
+                            cracker = ''.join([cracker, ' ', dn])
+                        rc = subprocess.call(shlex.split(cracker), stdout=fd)
+                        if rc == -2:
+                            self.pprint('Thermal watchdog barked', 'WARNING')
+                            self.sleepy()
+                            continue
+                        if rc >= 2 or rc == -1:
+                            self.pprint('hashcat {0} died with code {1}'.format(self.conf['cracker'], rc), 'FAIL')
+                            self.pprint('Check you have OpenCL support', 'FAIL')
+                            exit(1)
+
+                # TODO: use multiple -w:, when/if availible, see https://github.com/magnumripper/JohnTheRipper/issues/3262
+                if self.conf['format'] == 'wpapsk':
+                    if os.name == 'nt':
+                        dp = 'type '
+                    else:
+                        dp = 'cat '
+                    for dn in dictlist:
+                        dp = ''.join([dp, ' ', dn])
+                    cracker = '{0} {1} --stdin --pot={2} {3}'.format(self.conf['cracker'], self.conf['coptions'], self.conf['key_file'], self.conf['hccapx_file'])
+                    p1 = subprocess.Popen(shlex.split(dp), stdout=subprocess.PIPE)
+                    p2 = subprocess.Popen(shlex.split(cracker), stdin=p1.stdout, stdout=subprocess.PIPE)
+                    p1.stdout.close()
+                    p2.communicate()
+
+            except KeyboardInterrupt:
+                self.pprint('\nKeyboard interrupt', 'OKBLUE')
+                exit(0)
+
+            if fd:
+                fd.close()
 
             return
 
-#find executable in current dir or in PATH env var
-def which(program):
-    def is_exe(fpath):
-        return os.path.exists(fpath) and os.access(fpath, os.X_OK)
+    def get_key(self):
+        '''read bssid and key pairs from file'''
 
-    if os.name == 'nt':
-        program += '.exe'
-        if os.path.exists(program):
-            return program
+        def parse_hashcat(pot):
+            '''parse hashcat potfile line'''
+            try:
+                arr = pot.split(b':', 4)
+                bssid = arr[1][:12]
+                bssid = bssid[0:2] + \
+                    b':' + bssid[2:4] + \
+                    b':' + bssid[4:6] + \
+                    b':' + bssid[6:8] + \
+                    b':' + bssid[8:10] + \
+                    b':' + bssid[10:12]
+                return {'bssid': bssid, 'key': arr[4].rstrip(b'\r\n')}
+            except (TypeError, ValueError, KeyError, IndexError):
+                pass
 
-    fpath = os.path.split(program)[0]
-    if fpath:
-        if is_exe(program):
-            return program
-    else:
-        for path in os.environ['PATH'].split(os.pathsep):
-            exe_file = os.path.join(path, program)
-            if is_exe(exe_file):
-                return exe_file
-        if os.name == 'posix' and is_exe(program):
-            return './' + program
-
-    return False
-
-#run external tool and check returncode
-def run_tool(xtool):
-    if not isinstance(xtool, basestring):
-        return False
-
-    try:
-        subprocess.check_call(shlex.split(xtool), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except (subprocess.CalledProcessError, OSError):
-        return False
-
-    return True
-
-#Hashcat always returns returncode 255
-def run_hashcat(tool_hashcat):
-    if not isinstance(tool_hashcat, basestring):
-        return False
-
-    try:
-        acp = subprocess.Popen(tool_hashcat, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        output = acp.communicate()[0]
-    except OSError:
-        return False
-    if output.find('hashcat') != -1:
-        return True
-
-    return False
-
-#look for cracking tools, check for their capabilities, ask user
-def check_tools():
-    tools = []
-
-    #search for general tools
-    tl = ['pyrit', 'aircrack-ng']
-    for xt in tl:
-        t = which(xt)
-        if t:
-            tools.append(t)
-
-    bits = platform.architecture()[0]
-    if bits == '64bit':
-        #this is for Hashcat
-        tl = ['hashcat-cli64', 'hashcat-cliAVX', 'hashcat-cliXOP', 'hashcat-cli64.bin', 'hashcat-cliAVX.bin', 'hashcat-cliXOP.bin', 'hashcat-cli64.app']
-        for xt in tl:
-            t = which(xt)
-            if t and run_hashcat(t):
-                tools.append(t)
-        #this is for oclHashcat
-        tl = ['hashcat64.bin', 'hashcat64', 'oclHashcat64', 'oclHashcat64.bin', 'cudaHashcat64', 'cudaHashcat64.bin']
-        for xt in tl:
-            t = which(xt)
-            if t and run_tool(t+' -V'):
-                tools.append(t)
-    else:
-        #this is for Hashcat
-        tl = ['hashcat-cli32', 'hashcat-cli32.bin']
-        for xt in tl:
-            t = which(xt)
-            if t and run_hashcat(t):
-                tools.append(t)
-        #this is for oclHashcat
-        tl = ['hashcat32.bin', 'hashcat32', 'oclHashcat32', 'oclHashcat32.bin', 'cudaHashcat32', 'cudaHashcat32.bin']
-        for xt in tl:
-            t = which(xt)
-            if t and run_tool(t+' -V'):
-                tools.append(t)
-
-    if len(tools) == 0:
-        print cc['FAIL'] + 'No aircrack-ng, pyrit, Hashcat or oclHashcat found' + cc['ENDC']
-        exit(1)
-    if len(tools) == 1:
-        return tools[0]
-
-    print cc['HEADER'] + 'Choose the tool for cracking:' + cc['ENDC']
-    for index, ttool in enumerate(tools):
-        print '{0}: {1}'.format(index, ttool)
-    print '9: Quit'
-    while 1:
-        user = raw_input('Index:')
-        if user == '9':
-            exit(0)
-        try:
-            return tools[int(user)]
-        except (ValueError, IndexError):
-            print cc['WARNING'] + 'Wrong index' + cc['ENDC']
-
-#get work
-def get_work_wl(options):
-    work = get_url(get_work_url+'='+hc_ver, options)
-    try:
-        xnetdata = json.loads(work)
-        if len(xnetdata['mic']) != 32:
-            return False
-        if len(xnetdata['dhash']) != 32:
-            return False
-        if not valid_mac(xnetdata['bssid']):
             return False
 
-        return xnetdata
-    except (TypeError, ValueError, KeyError):
-        if work == 'Version':
-            print cc['FAIL'] + 'Please update help_crack, the interface has changed' + cc['ENDC']
-            exit(1)
-        if work == 'No nets':
-            print cc['WARNING'] + 'No suitable net found' + cc['ENDC']
-            return False
+        def parse_jtr(pot):
+            '''parse JtR potfile line'''
+            def jb64decode(jb64):
+                '''JtR b64 decode'''
+                encode_trans = maketrans(b'./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
+                                         b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/')
+                b64 = jb64.translate(encode_trans) + b'='
 
-        print cc['WARNING'] + 'Server response error' + cc['ENDC']
+                return binascii.a2b_base64(b64)
 
-    return False
-
-#prepare work based on netdata; returns dictname
-def prepare_work(xnetdata, etype):
-    if xnetdata is None:
-        return False
-
-    try:
-        #write net
-        try:
-            gznet = base64.b64decode(xnetdata[etype])
-            gzstream = StringIO.StringIO(gznet)
-            fgz = gzip.GzipFile(fileobj=gzstream)
-            fd = open(net_file, 'wb')
-            fd.write(fgz.read())
-            fd.close()
-            fgz.close()
-        except Exception as e:
-            print cc['FAIL'] + 'Net data extraction failed' + cc['ENDC']
-            print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-            return False
-
-        #check for dict and download it
-        dictmd5 = ''
-        extract = False
-        gzdictname = xnetdata['dpath'].split('/')[-1]
-        xdictname = gzdictname.rsplit('.', 1)[0]
-        if os.path.exists(gzdictname):
-            dictmd5 = md5file(gzdictname)
-        if xnetdata['dhash'] != dictmd5:
-            print cc['OKBLUE'] + 'Downloading ' + gzdictname + cc['ENDC']
-            if not download(xnetdata['dpath'], gzdictname):
-                print cc['FAIL'] + 'Can\'t download dict ' + xnetdata['dpath'] + cc['ENDC']
+            arr = pot.split(b':', 1)
+            if len(arr) != 2:
                 return False
-            if md5file(gzdictname) != xnetdata['dhash']:
-                print cc['WARNING'] + 'Dict downloaded but hash mismatch dpath:{0} dhash:{1}'.format(xnetdata['dpath'], xnetdata['dhash']) + cc['ENDC']
+            key = arr[1].rstrip(b'\r\n')
 
-            extract = True
+            arr = arr[0].split(b'#', 1)
+            if len(arr) != 2:
+                return False
 
-        if not os.path.exists(xdictname):
-            extract = True
-
-        if extract:
-            print cc['OKBLUE'] + 'Extracting ' + gzdictname + cc['ENDC']
             try:
-                with gzip.open(gzdictname, 'rb') as ftgz:
-                    f = open(xdictname, 'wb')
+                phccap = jb64decode(arr[1])
+                bssid = binascii.hexlify(phccap[:6])
+                bssid = bssid[0:2] + \
+                    b':' + bssid[2:4] + \
+                    b':' + bssid[4:6] + \
+                    b':' + bssid[6:8] + \
+                    b':' + bssid[8:10] + \
+                    b':' + bssid[10:12]
+            except (binascii.Error, binascii.Incomplete):
+                return False
+
+            return {'bssid': bssid, 'key': key}
+
+        def parse_pmkid(pot):
+            '''parse PMKID potfile line'''
+            try:
+                arr = pot.split(b':', 1)
+                arr1 = arr[0].split(b'*', 3)
+                bssid = arr1[1]
+                bssid = bssid[0:2] + \
+                    b':' + bssid[2:4] + \
+                    b':' + bssid[4:6] + \
+                    b':' + bssid[6:8] + \
+                    b':' + bssid[8:10] + \
+                    b':' + bssid[10:12]
+                return {'bssid': bssid, 'key': arr[1].rstrip(b'\r\n')}
+            except (TypeError, ValueError, KeyError, IndexError):
+                pass
+
+            return False
+
+        res = []
+        try:
+            if os.path.exists(self.conf['key_file']):
+                with open(self.conf['key_file'], 'rb') as fd:
                     while True:
-                        block = ftgz.read(blocksize)
-                        if block == '':
+                        line = fd.readline()
+                        if not line:
                             break
-                        f.write(block)
-                f.close()
-                ftgz.close()
-            except Exception as e:
-                print cc['FAIL'] + gzdictname + ' extraction failed' + cc['ENDC']
-                print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
 
-        return xdictname
-    except TypeError as e:
-        print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
+                        # check if we have user potfile. Don't write if it's the challenge
+                        if self.conf['potfile'] and not \
+                            (b'76c6eaf116d91cc1450561b00c98ea19' in line
+                             or b'55vZsj9E.0P59YY.N3gTO2cZNi6GNj2XewC4n3RjKH' in line
+                             or b'8ac36b891edca8eef49094b1afe061acd0*1c7ee5e2f2d0' in line):
+                            with open(self.conf['potfile'], 'ab') as fdpot:
+                                fdpot.write(line)
 
-    return False
+                        keypair = parse_hashcat(line)
+                        if keypair:
+                            res.append(keypair)
+                            continue
+                        keypair = parse_jtr(line)
+                        if keypair:
+                            res.append(keypair)
+                            continue
+                        keypair = parse_pmkid(line)
+                        if keypair:
+                            res.append(keypair)
+                            continue
 
-#prepare chalenge files
-def prepare_challenge(etype):
-    xnetdata = {'cap': """H4sICMX/HVQCA0d1ZXN0LmNhcAC7cnjTQiYGFgYY+P+fgSGTAQFOQnEDWA4EGCQsN7G9hZABDkLC\
-                          dbpqQLkUBkEWBlb30tTiEkaOppbuaSoGHjnMjGysLAyMDAxajAz6jAwGEkAm/xomJhDJAmJB+AwM\
-                          Riw8QhIJdzkZBCSYmL4AjbsrxzDBx1hOQgrkHizgrhRQ3oSNlw2bnAxDwCdGoNEBn0BWBXxiAbEg\
-                          fISqmVDMwWXFyCKX4t3MgeKxm6tWMQNlO/qYmBlKmRi6GASg+pgcWX4zCD8+4HxdvbHeWIz1qojr\
-                          9xUryrOaRPbGzTTV9JvLQCoQuysCCo9lAWozJoq7qJ4R/FM588BSFwyHMloxQhyH7FyF1SgOZeRC\
-                          OPTsUeXVVntX39v7SjFY1D5CoJFZwOjn4tQzi43PHD9TfNyYkLtel7/+u/jBMXEvO651a0USwhnE\
-                          DEQgEQYmWSBsHgYArgaqj0MCAAA=""",
-                'hccap': """H4sICN7CXVYCA2d1ZXN0Lm5ldABzL00tLmEgACQsN7G9ZZFL8W7mOHtUebXV3tX39r5SDBa1jxBo\
-                            ZBYw+rk49cxi4zPHzxQfN3Zk+c0g/PiA83X1xnpjMdarIq7fV6woz2oS2Rs301TTby4TM0MpEyMX\
-                            gwDUaCZCBjKQCsQMRBgZGPjXMIFJFgibh2GQgEqQn4H4dfnrv4sfHBP3suNat1YkIRwAu+stjIgB\
-                            AAA=""",
-                'bssid': '00:18:39:b2:06:ed',
-                'mic': 'eb77ebfda3e0c6174a3e0aaead146057',
-                'key': 'password1234',
-                'dictname': 'challenge.txt'}
-    try:
-        #write net
-        try:
-            gznet = base64.b64decode(xnetdata[etype])
-            gzstream = StringIO.StringIO(gznet)
-            fgz = gzip.GzipFile(fileobj=gzstream)
-            fd = open(net_file, 'wb')
-            fd.write(fgz.read())
-            fd.close()
-            fgz.close()
-        except Exception as e:
-            print cc['FAIL'] + 'Net data extraction failed' + cc['ENDC']
-            print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-            return None
-
-        #create dict
-        try:
-            f = open(xnetdata['dictname'], 'wb')
-            f.write(xnetdata['key'] + "\n")
-            f.close()
-        except Exception as e:
-            print cc['FAIL'] + xnetdata['dictname'] + ' creation failed' + cc['ENDC']
-            print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-            return None
-
-        return xnetdata
-    except TypeError as e:
-        print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-
-    return None
-
-#return results to server
-def put_work(mic, pwkey):
-    data = urllib.urlencode({mic: pwkey})
-    try:
-        response = urllib.urlopen(put_work_url, data)
-    except Exception as e:
-        print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-        return False
-
-    remote = response.read()
-    response.close()
-
-    if remote != 'OK':
-        return False
-
-    return True
-
-#create resume file
-def create_resume(xnetdata):
-    with open(res_file, 'w') as outfile:
-        json.dump(xnetdata, outfile)
-
-#multiplatform lower priority
-def low_priority():
-    if os.name == 'posix':
-        os.nice(10)
-    else:
-        try:
-            import win32api, win32process, win32con
-
-            pid = win32api.GetCurrentProcessId()
-            handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
-            win32process.SetPriorityClass(handle, win32process.BELOW_NORMAL_PRIORITY_CLASS)
-        except Exception as e:
-            print cc['FAIL'] + 'Exception: {0}'.format(e) + cc['ENDC']
-            print cc['FAIL'] + 'Maybe you lack Python for Windows extensions. Link: http://sourceforge.net/projects/pywin32' + cc['ENDC']
-
-#check for resume files
-def resume_check():
-    if os.path.exists(res_file):
-        netdataf = open(res_file)
-        try:
-            xnetdata = json.load(netdataf)
-            if len(xnetdata['mic']) != 32:
-                raise ValueError
-            print cc['OKBLUE'] + 'Session resume' + cc['ENDC']
-            return xnetdata
-        except (TypeError, ValueError, KeyError):
-            print cc['WARNING'] + 'Bad resume file contents' + cc['ENDC']
-            os.unlink(res_file)
-
-    return None
-
-print cc['HEADER'] + 'help_crack, distributed WPA cracker, v{0}\nsite: {1}'.format(hc_ver, base_url) + cc['ENDC']
-
-wordlist = ''
-if len(sys.argv) > 1:
-    print cc['HEADER'] + 'Usage: ./help_crack.py : download capture and wordlist then start cracking' + cc['ENDC']
-    exit(1)
-
-check_version()
-tool = check_tools()
-#lower priority for CPU crackers. Pyrit goes here too
-if tool.find('aircrack-ng') != -1 or tool.find('pyrit') != -1 or tool.find('hashcat-cli') != -1:
-    low_priority()
-
-#set format
-if tool.find('ashcat') != -1:
-    fformat = 'hccap'
-else:
-    fformat = 'cap'
-
-challenge = False
-resnetdata = resume_check()
-netdata = None
-while True:
-    if challenge:
-        if netdata is None:
-            netdata = get_work_wl(json.JSONEncoder().encode({'format': fformat, 'tool': os.path.basename(tool)}))
-            if netdata:
-                create_resume(netdata)
-
-        dictname = prepare_work(netdata, fformat)
-        if not dictname:
-            print cc['WARNING'] + 'Couldn\'t prepare data' + cc['ENDC']
-            netdata = None
-            sleepy()
-            continue
-
-    else:
-        netdata = prepare_challenge(fformat)
-        if netdata is None:
-            print cc['FAIL'] + 'Couldn\'t prepare challenge' + cc['ENDC']
+            if res:
+                os.unlink(self.conf['key_file'])
+                return res
+        except IOError as e:
+            self.pprint('Couldn\'t read pot file', 'FAIL')
+            self.pprint('Exception: {0}'.format(e), 'FAIL')
             exit(1)
-        dictname = netdata['dictname']
 
-    #check if we will use rules
-    rule = ''
-    if 'rule' in netdata:
-        if tool.find('ashcat') != -1:
-            if os.path.exists(netdata['rule']):
-                rule = '-r' + netdata['rule']
+        return None
 
-    #run oclHashcat in performance tune mode
-    performance = ''
-    if tool.find('Hashcat') != -1:
-        performance = '-w 3'
+    def run(self):
+        '''entry point'''
+        self.check_version()
+        self.check_tools()
 
-    #run cracker
-    try:
-        if tool.find('pyrit') != -1:
-            cracker = '{0} -i{1} -o{2} -b{3} -r{4} attack_passthrough'.format(tool, dictname, key_file, netdata['bssid'], net_file)
-            subprocess.call(shlex.split(cracker))
-        if tool.find('aircrack-ng') != -1:
-            cracker = '{0} -w{1} -l{2} -b{3} {4}'.format(tool, dictname, key_file, netdata['bssid'], net_file)
-            subprocess.call(shlex.split(cracker))
-        if tool.find('ashcat') != -1:
-            try:
-                cracker = '{0} -m2500 --potfile-disable --outfile-format=2 {1} -o{2} {3} {4} {5}'.format(tool, performance, key_file, rule, net_file, dictname)
-                subprocess.check_call(shlex.split(cracker))
-            except subprocess.CalledProcessError as ex:
-                if ex.returncode == -2:
-                    print cc['WARNING'] + 'Thermal watchdog barked' + cc['ENDC']
-                    sleepy()
-                    continue
-                if ex.returncode == -1:
-                    print cc['FAIL'] + 'Internal error' + cc['ENDC']
-                    exit(1)
-                if ex.returncode == 1:
-                    print cc['OKBLUE'] + 'Exausted' + cc['ENDC']
-                if ex.returncode == 2:
-                    print cc['FAIL'] + 'User abort' + cc['ENDC']
-                    exit(1)
-                if ex.returncode not in [-2, -1, 1, 2]:
-                    print cc['FAIL'] + 'Cracker {0} died with code {1}'.format(tool, ex.returncode) + cc['ENDC']
-                    print cc['FAIL'] + 'Check you have CUDA/OpenCL support' + cc['ENDC']
-                    exit(1)
-    except KeyboardInterrupt as ex:
-        print cc['OKBLUE'] + '\nKeyboard interrupt' + cc['ENDC']
-        if os.path.exists(key_file):
-            os.unlink(key_file)
-        exit(1)
+        # challenge the cracker
+        self.pprint('Challenge cracker for correct results', 'OKBLUE')
+        netdata = self.prepare_challenge()
+        self.prepare_work(netdata)
+        self.run_cracker([netdata[0]['dictname']], disablestdout=True)
+        keypair = self.get_key()
 
-    #if we have key, submit it
-    if os.path.exists(key_file):
-        ktf = open(key_file, 'r')
-        key = ktf.readline()
-        ktf.close()
-        key = key.rstrip('\n')
-        if len(key) >= 8:
-            if challenge:
-                print cc['OKGREEN'] + 'Key for capture mic {0} is: {1}'.format(netdata['mic'], key.decode('utf8', 'ignore'))+cc['ENDC']
-                while not put_work(netdata['mic'], key):
-                    print cc['WARNING'] + 'Couldn\'t submit key' + cc['ENDC']
-                    sleepy()
+        if not keypair \
+                or len(keypair) != 2 \
+                or keypair[0]['key'] != bytearray(netdata[0]['key'], 'utf-8', errors='ignore') \
+                or keypair[1]['key'] != bytearray(netdata[0]['key'], 'utf-8', errors='ignore'):
+            self.pprint('Challenge solving failed! Check if your cracker runs correctly.', 'FAIL')
+            exit(1)
+
+        hashcache = set()
+        netdata = self.resume_check()
+        metadata = {'ssid': '00'}
+        options = {'format': self.conf['format'], 'cracker': self.conf['cracker'], 'dictcount': self.conf['dictcount']}
+        while True:
+            if netdata is None:
+                if self.conf['custom']:
+                    options['ssid'] = metadata['ssid']
+                netdata = self.get_work(json.JSONEncoder().encode(options))
+
+            self.create_resume(netdata)
+            metadata = self.prepare_work(netdata)
+
+            # add custom dict or prepare remote ones
+            if self.conf['custom']:
+                dictlist = list([self.conf['custom']])
             else:
-                if netdata['key'] == key:
-                    print cc['OKBLUE'] + 'Challenge solved successfully!' + cc['ENDC']
-                    challenge = True
-                    netdata = resnetdata
+                dictlist = self.prepare_dicts(netdata)
 
-        os.unlink(key_file)
-    else:
-        if not challenge:
-            print cc['FAIL'] + 'Challenge solving failed! Check if your cracker runs correctly.' + cc['ENDC']
-            exit(1)
-        print cc['OKBLUE'] + 'Key for capture mic {0} not found.'.format(netdata['mic']) + cc['ENDC']
+            # do we have additional user dictionary supplied?
+            if conf['additional'] is not None:
+                # compute handshakes simple hash
+                ndhash = 0
+                for part in netdata:
+                    if 'hccapx' in part:
+                        ndhash ^= hash(part['hccapx'])
+                if ndhash not in hashcache:
+                    hashcache.add(ndhash)
+                    dictlist.append(conf['additional'])
 
-    #cleanup
-    if os.path.exists(net_file):
-        os.unlink(net_file)
-    if resnetdata != netdata:
-        if os.path.exists(res_file):
-            os.unlink(res_file)
-    netdata = None
+            # run cracker and collect results
+            cstart = time.time()
+            self.run_cracker(dictlist)
+            cdiff = int(time.time() - cstart)
+            if self.conf['autodictcount']:
+                if options['dictcount'] < 15 and cdiff < 300:  # 5 min
+                    options['dictcount'] += 1
+                    self.pprint('Incrementing dictcount to {0}, last duration {1}s'.format(options['dictcount'], cdiff), 'OKBLUE')
+                if options['dictcount'] > 1 and cdiff > 300:
+                    options['dictcount'] -= 1
+                    self.pprint('Decrementing dictcount to {0}, last duration {1}s'.format(options['dictcount'], cdiff), 'OKBLUE')
+
+            keypair = self.get_key()
+            if keypair:
+                for k in keypair:
+                    self.pprint('Key for bssid {0} is: {1}'.format(k['bssid'].decode(sys.stdout.encoding or 'utf-8', errors='ignore'),
+                                                                   k['key'].decode(sys.stdout.encoding or 'utf-8', errors='ignore')), 'OKGREEN')
+            self.put_work(metadata, keypair)
+
+            # cleanup
+            if os.path.exists(self.conf['res_file']):
+                os.unlink(self.conf['res_file'])
+            netdata = None
+
+
+if __name__ == "__main__":
+    def is_valid_file(aparser, arg):
+        '''check if it's a valid file'''
+        if not os.path.isfile(arg):
+            aparser.error('The file {} does not exist!'.format(arg))
+        return arg
+
+    def is_valid_dc(aparser, arg):
+        '''check if it's a valid dict count'''
+        iarg = int(arg)
+        if iarg <= 0 or iarg > 15:
+            aparser.error('dictionaries count must be between 1 and 15')
+        return arg
+
+    parser = argparse.ArgumentParser(description='help_crack, distributed WPA cracker site: {0}'.format(conf['base_url']))
+    parser.add_argument('-v', '--version', action='version', version=conf['hc_ver'])
+    parser.add_argument('-co', '--coptions', type=str, help='custom options, that will be supplied to cracker. Those must be passed as -co="--your_option"')
+    parser.add_argument('-pot', '--potfile', type=str, help='preserve cracked results in user supplied pot file')
+    parser.add_argument('-dc', '--dictcount', type=lambda x: is_valid_dc(parser, x), help='count of dictionaries to be downloaded and checked against')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-ad', '--additional', type=lambda x: is_valid_file(parser, x), help='additional user dictionary to be checked after downloaded one')
+    group.add_argument('-cd', '--custom', type=lambda x: is_valid_file(parser, x), help='custom user dictionary to be checked against all uncracked handshakes')
+
+    try:
+        args = parser.parse_args()
+    except IOError as e:
+        parser.error(str(e))
+
+    conf['additional'] = args.additional
+    conf['custom'] = args.custom
+    if args.coptions:
+        conf['coptions'] = args.coptions
+    if args.potfile:
+        conf['potfile'] = args.potfile
+    if args.dictcount:
+        conf['dictcount'] = args.dictcount
+        conf['autodictcount'] = False
+
+    hc = HelpCrack(conf)
+    hc.run()

@@ -6,37 +6,43 @@ Those are the basic steps for local installation of the distributed WPA PSK audi
 Requirements
 -
 
- - Linux OS - tested with Ubuntu 14.04
+ - Linux OS - tested with Ubuntu 16.04
  - MySQL database 5.5 or better
- - PHP 5.3 or better
- - Apache or other webserver with PHP support
+ - PHP 5.5 or better. PHP 7.x recommended
+ - Apache or other webserver with PHP support, vhost configured with https
  - gcc toolchain
- - libnl3, eg. `sudo apt-get install libnl-3-dev libnl-genl-3-dev`
- - Pyrit, eg `sudo apt-get install pyrit`
- - cap2hccap tool, available from https://sourceforge.net/projects/cap2hccap
- - git, subversion `sudo apt-get install git subversion`
- - reCAPTCHA API keys for your domain, register here https://www.google.com/recaptcha 
+ - hcxpcaptool tool, part of hcxtools https://github.com/ZerBea/hcxtools
+ - git `sudo apt-get install git`
+ - reCAPTCHA API keys for your domain, register here https://www.google.com/recaptcha
+ - routerkeygenPC, https://github.com/routerkeygen/routerkeygenPC
 
 Compilation of external tools
 -
 
-- cap2hccap
-You can download ready made binaries, or just do it yourself:
+- hcxpcaptool
 ```
-$ svn checkout svn://svn.code.sf.net/p/cap2hccap/svn/trunk cap2hccap
-$ cd cap2hccap
+$ git clone https://github.com/ZerBea/hcxtools
+$ cd hcxtools
 $ make
 ```
-Your binary should be `cap2hccap.bin`.
+Your binary should be `hcxpcaptool`.
 
-- wpaclean
-You *must* use bundled version from dwpa repo:
+- routerkeygenPC
+Install qt5 development environment.
 ```
-$ git clone https://github.com/RealEnder/dwpa
-$ cd dwpa/misc/wpaclean
-$ make
+$ git clone https://github.com/routerkeygen/routerkeygenPC
+$ cd routerkeygenPC
+$ ./buid_linux.sh
 ```
-Your binary should be `wpaclean`.
+Your binary should be `linux/bin/routerkeygen`.
+
+> **Note1:**
+> The current version of routerkeygenPC have cli support, but it's liked with QT GUI widgets.
+> Version with only qt-core dependency can be found here: https://github.com/RealEnder/routerkeygenPC/tree/master/cli
+> To build it, use: `cd cli; qmake; make`. Your binary should be `routerkeygen-cli`.
+
+> **Note2:**
+> Example crontab entry for running can be found in `misc/` directory.
 
 Database
 -
@@ -76,17 +82,17 @@ Dictionaries
 
 Your dictionaries have to conform requirements for WPA PSK - every password candidate have to be between 8 and 63 bytes long. All dictionaries have to be text files with .txt extension, one password candidate per line.
 There is one special dictionary - cracked.txt. This one will contain already cracked PSKs. The dictionary will be autocreated by the script below.
-You will need to know the URL of directory, under where your dictionaries will be accessed by clients, eg. `http://[example.com]/dict/`.
+You will need to know the URL of directory, under where your dictionaries will be accessed by clients, eg. `https://[example.com]/dict/`.
 Start with copying all your dictionaries in separate directory. Then copy in it the preparation script `misc/create_gz.sh` from dwpa repo and execute it:
 ```
 $ ls
 create_gz.sh  dict1.txt  dict2.txt
 $ ./create_gz.sh
 Compress dictionaries(*.txt) in current dir and create inserts for dwpa
-Enter base URL for dict with trailing /: http://example.com/dict/
-INSERT INTO dicts (dpath, dhash, dname, wcount, hits) VALUES ('http://example.com/dict/cracked.txt.gz', X'f54e2d10d5f790295c3401f8074df51f', 'cracked', 1, 0);
-INSERT INTO dicts (dpath, dhash, dname, wcount, hits) VALUES ('http://example.com/dict/dict1.txt.gz', X'17e5a375da3670754bf40657a1fc5876', 'dict1', 1, 0);
-INSERT INTO dicts (dpath, dhash, dname, wcount, hits) VALUES ('http://example.com/dict/dict2.txt.gz', X'bd189d3f58169dc7bf58427d273d95c5', 'dict2', 2, 0);
+Enter base URL for dict with trailing /: https://example.com/dict/
+INSERT INTO dicts (dpath, dhash, dname, wcount, hits) VALUES ('https://example.com/dict/cracked.txt.gz', X'f54e2d10d5f790295c3401f8074df51f', 'cracked', 1, 0);
+INSERT INTO dicts (dpath, dhash, dname, wcount, hits) VALUES ('https://example.com/dict/dict1.txt.gz', X'17e5a375da3670754bf40657a1fc5876', 'dict1', 1, 0);
+INSERT INTO dicts (dpath, dhash, dname, wcount, hits) VALUES ('https://example.com/dict/dict2.txt.gz', X'bd189d3f58169dc7bf58427d273d95c5', 'dict2', 2, 0);
 $ ls
 cracked.txt     create_gz.sh  dict1.txt.gz  dict2.txt.gz
 cracked.txt.gz  dict1.txt     dict2.txt     dict.sql
@@ -104,7 +110,7 @@ $
 Web application configuration
 -
 - Copy all files from `web` directory from dwpa repo to your webserver root
-- Copy previously built `wpaclean` and `cap2hccap` binaries to a location, where web server process can execute it, eg. in webserver root
+- Copy previously built `hcxpcaptool` binary to a location, where web server process can execute it, eg. in webserver root
 - edit `mail.php` and put your own SMTP configuration
 - Make sure webserver process can write to dictionaries location (to update cracked.txt.gz) and capture file location(`CAP` define from conf.php), where submissions will be written
 - `bosskey` must be 32 byte hexadecimal string, known to you, with which you will be able to see cracked PSKs in clear and search full database
@@ -130,9 +136,9 @@ $privatekey = '<your reCAPTCHA private key>';
 //bosskey
 $bosskey = '01234567890123456789012345678901';
 //App specific defines
-define('PYRIT', 'pyrit');
-define('WPACLEAN', '/var/www/wpa-sec/wpaclean');
-define('CAP2HCCAP', '/var/www/wpa-sec/cap2hccap');
+define('HCXPCAPTOOL', '/var/www/wpa-sec/cap/hcxpcaptool');
+define('RKG', '/var/www/wpa-sec/cap/routerkeygen-cli');
+
 define('CAP', '/var/www/wpa-sec/cap/');
 define('CRACKED', '/var/www/wpa-sec/dict/cracked.txt.gz');
 if (is_dir('/run/shm'))
@@ -141,7 +147,7 @@ elseif (is_dir('/dev/shm'))
     define('SHM', '/dev/shm/');
 else
     die('Can not access SHM!');
-define('MIN_HC_VER', '0.8.7');
+define('MIN_HC_VER', '0.9.0');
 ?>
 ```
 
@@ -151,4 +157,4 @@ Client application configuration
 Your clients will run `help_crack.py` to fetch uncracked net and dictionary. You'll need to do the following changes:
 
 - Copy `help_crack.py`, `help_crack.py.version` and `CHANGELOG` files from `dwpa` repo under `hc/` directory of your webserver root
-- Change `base_url` variable from `help_crack.py` to point to your server URL, eg. `base_url = 'http://example.com/'`, with trailing /
+- Change `base_url` variable from `help_crack.py` to point to your server URL, eg. `base_url = 'https://example.com/'`, with trailing /

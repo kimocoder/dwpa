@@ -78,3 +78,41 @@ ver 0.8.7 / 23 Jan 2016
 ver 0.8.8 / 2 Jul 2016
  * don't use ANSI cc on windows
  * detect hashcat 3.0
+ 
+ver 0.9.0 / 10 Feb 2018
+ * process hccapx struct and DWPA new API
+ * require hashcat v4.0.1+
+ * drop aircrack-ng and pyrit support since they
+   don't currently support AP nonce corrections
+ * python 2/3 compatability
+
+ver 0.9.1 / 1 Mar 2018
+ * add JtR support
+ * implement help_crack.py options for:
+   * external user dictionary
+   * additional user dictionary to system ones
+   * local potfile with cracked results
+ * ssl support
+ * python 2/3 compatability fixes
+ * various bugfixes
+ 
+ver 1.0.0 / 15 Mar 2018
+ * combine same essid handshakes
+ * disable hashcat log
+ * general bugfixes and improvements
+
+ver 1.0.1 / 30 Mar 2018
+ * fix for potfile reading for essid combine
+ * skip user dict against same handshakes
+ * windows compatibility fix
+
+ver 1.0.2 / 17 Jun 2018
+ * run additional dictionary in the same session,
+   which allows for single GPU kernel init
+ * add option to fetch more than one dict
+ * automatically set appropriate dict count based
+   on client performance
+
+ver 1.1.0 / 27 Jul 2018
+ * add PMKID support
+ * bump req to latest hashcat and JtR

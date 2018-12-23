@@ -13,9 +13,8 @@ $privatekey = '';
 $bosskey = '';
 
 //App specific defines
-define('PYRIT', 'pyrit');
-define('WPACLEAN', '/var/www/wpa-sec/cap/wpaclean');
-define('CAP2HCCAP', '/var/www/wpa-sec/cap/cap2hccap');
+define('HCXPCAPTOOL', '/var/www/wpa-sec/cap/hcxpcaptool');
+define('RKG', '/var/www/wpa-sec/cap/routerkeygen-cli');
 
 define('CAP', '/var/www/wpa-sec/cap/');
 define('CRACKED', '/var/www/wpa-sec/dict/cracked.txt.gz');
@@ -26,5 +25,5 @@ elseif (is_dir('/dev/shm'))
 else
     die('Can not access SHM!');
 
-define('MIN_HC_VER', '0.8.7');
+define('MIN_HC_VER', '1.1.0');
 ?>

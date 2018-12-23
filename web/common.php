@@ -1,394 +1,902 @@
 <?php
-//php 5.5 has this one
-if (! function_exists('hash_pbkdf2')) {
-    // based on https://defuse.ca/php-pbkdf2.htm
-    function hash_pbkdf2($algorithm, $password, $salt, $count, $key_length, $raw_output = false)
-    {
-        $hash_length = array('sha1' => 20,
-                             'md5'  => 16,);
+// Implements hashcat $HEX[]
+function hc_unhex($key) {
+    $k = substr($key, 5, -1);
+    if (( (bool) (~ strlen($k) & 1)) &&
+        (0 === substr_compare($key, '$HEX[', 0, 5)) &&
+        (0 === substr_compare($key, ']', -1)) &&
+        (ctype_xdigit($k))) {
 
-        $block_count = ceil($key_length / $hash_length[$algorithm]);
-
-        $output = '';
-        for($i = 1; $i <= $block_count; $i++) {
-            // $i encoded as 4 bytes, big endian.
-            $last = $salt . pack("N", $i);
-            // first iteration
-            $last = $xorsum = hash_hmac($algorithm, $last, $password, true);
-            // perform the other $count - 1 iterations
-            for ($j = 1; $j < $count; $j++) {
-                $xorsum ^= ($last = hash_hmac($algorithm, $last, $password, true));
-            }
-            $output .= $xorsum;
-        }
-
-        if($raw_output)
-            return substr($output, 0, $key_length);
-        else
-            return bin2hex(substr($output, 0, $key_length));
+        return hex2bin($k);
     }
+
+    return $key;
 }
 
-// helper function for PHP version < 5.4.0
-if (function_exists('hex2bin') == False) {
-    /* Alternative working, but slow function
-    function hex2bin($h) {
-        if (strlen($h) % 2 != 0)
-            $h = '0'.$h;
-        if (!ctype_xdigit($h))
-            return '';
-        $r = '';
-        for ($i=0; $i<strlen($h); $i+=2)
-            $r .= chr(hexdec($h{$i}.$h{($i+1)}));
-        return $r;
+// Used by omac1_aes_128()
+function omac1_aes_128_leftShift($data, $bits) {
+    $mask   = (0xff << (8 - $bits)) & 0xff;
+    $state  = 0;
+    $result = '';
+    $length = strlen($data);
+    for ($i = $length - 1; $i >= 0; $i--) {
+        $tmp     = ord($data[$i]);
+        $result .= chr(($tmp << $bits) | $state);
+        $state   = ($tmp & $mask) >> (8 - $bits);
     }
-    */
-    function hex2bin($h) {
-        if (strlen($h) & 1)
-            $h = '0'.$h;
 
-        return pack('H*', $h);
+    return strrev($result);
+}
+
+// Implements omac1_aes_128 (cmac)
+// Based on https://github.com/ircmaxell/PHP-CryptLib
+function omac1_aes_128($data, $key) {
+    // generate keys
+    $keys      = array();
+    $blockSize = 16;
+    // this is based on blocksize * 8
+    //   64:  str_repeat(chr(0), 7) . chr(0x1B)
+    //   128: str_repeat(chr(0), 15) . chr(0x87)
+    $rVal      = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x87";
+    // this must be block size in length
+    $cBlock    = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+    $lVal      = openssl_encrypt($cBlock, 'aes-128-ecb', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING);
+
+    $keys[0] = omac1_aes_128_leftShift($lVal, 1);
+    if (ord($lVal[0]) > 127) {
+        $keys[0] = $keys[0] ^ $rVal;
     }
+    $keys[1] = omac1_aes_128_leftShift($keys[0], 1);
+    if (ord($keys[0][0]) > 127) {
+        $keys[1] = $keys[1] ^ $rVal;
+    }
+
+    // split data into mBlocks
+    $mBlocks = str_split($data, $blockSize);
+    $last = end($mBlocks);
+    if (strlen($last) != $blockSize) {
+        // pad the last element
+        $last .= "\x80" . str_repeat("\0", $blockSize - 1 - strlen($last));
+        $last  = $last ^ $keys[1];
+    } else {
+        $last = $last ^ $keys[0];
+    }
+    $mBlocks[count($mBlocks) - 1] = $last;
+
+    // work on all blocks
+    foreach ($mBlocks as $block) {
+        $cBlock = openssl_encrypt($cBlock ^ $block, 'aes-128-ecb', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING);
+    }
+
+    // for other block sizes we must cut: substr($cBlock, 0, $blockSize)
+    return $cBlock;
 }
 
 /*
-    check_key(hccap contents, array of keys)
+    check_key_hccapx(hccapx contents,
+                     array of keys,
+                     nonce correction to be used - positive integer,
+                     binary PMK to be used)
     return:  False: bad format;
              Null: not found
-             string: the key
-    hccap structure http://hashcat.net/wiki/doku.php?id=hccap
+             array('key_found',
+                    0, //nonce correction value if used
+                    'BE', //big endian(BE) or little endian(LE), if detected
+                    PMK)
+    hccapx structure https://hashcat.net/wiki/doku.php?id=hccapx
 
-    typedef struct
+    #define HCCAPX_SIGNATURE 0x58504348 // HCPX
+    struct hccapx
     {
-        char          essid[36];
+      u32 signature;
+      u32 version;
+      u8  message_pair;
+      u8  essid_len;
+      u8  essid[32];
+      u8  keyver;
+      u8  keymic[16];
+      u8  mac_ap[6];
+      u8  nonce_ap[32];
+      u8  mac_sta[6];
+      u8  nonce_sta[32];
+      u16 eapol_len;
+      u8  eapol[256];
 
-        unsigned char mac1[6];
-        unsigned char mac2[6];
-        unsigned char nonce1[32];
-        unsigned char nonce2[32];
-
-        unsigned char eapol[256];
-        int           eapol_size;
-
-        int           keyver;
-        unsigned char keymic[16];
-
-    } hccap_t;
+    } __attribute__((packed));
 */
-function check_key($hccap, $keys) {
-    if (strlen($hccap) != 392)
+
+function check_key_hccapx($hccapx, $keys, $nc=32767, $pmk=False) {
+    if (strlen($hccapx) != 393)
         return False;
 
-    $ahccap = array();
-    if (version_compare(PHP_VERSION, '5.5.0') >= 0) {
-        $ahccap['essid']      = unpack('Z36', substr($hccap, 0x000, 36));
-    } else {
-        $ahccap['essid']      = unpack('a36', substr($hccap, 0x000, 36));
+    $ahccapx = unpack('x8/Cmessage_pair/Cessid_len/a32essid/Ckeyver/a16keymic/a6mac_ap/a32nonce_ap/a6mac_sta/a32nonce_sta/veapol_len/a256eapol', $hccapx);
+
+    // cut essid and eapol
+    if ($ahccapx['essid_len'] < 32) {
+        $ahccapx['essid'] = substr($ahccapx['essid'], 0, $ahccapx['essid_len']);
     }
-    $ahccap['mac1']       =               substr($hccap, 0x024, 6);
-    $ahccap['mac2']       =               substr($hccap, 0x02a, 6);
-    $ahccap['nonce1']     =               substr($hccap, 0x030, 32);
-    $ahccap['nonce2']     =               substr($hccap, 0x050, 32);
-    $ahccap['eapol']      =               substr($hccap, 0x070, 256);
-    $ahccap['eapol_size'] = unpack('i',   substr($hccap, 0x170, 4));
-    $ahccap['keyver']     = unpack('i',   substr($hccap, 0x174, 4));
-    $ahccap['keymic']     =               substr($hccap, 0x178, 16);
-
-    // fixup unpack
-    $ahccap['essid']      = $ahccap['essid'][1];
-    $ahccap['eapol_size'] = $ahccap['eapol_size'][1];
-    $ahccap['keyver']     = $ahccap['keyver'][1];
-
-    // cut eapol to right size
-    $ahccap['eapol'] = substr($ahccap['eapol'], 0, $ahccap['eapol_size']);
+    if ($ahccapx['eapol_len'] < 256) {
+        $ahccapx['eapol'] = substr($ahccapx['eapol'], 0, $ahccapx['eapol_len']);
+    }
 
     // fix order
-    if (strncmp($ahccap['mac1'], $ahccap['mac2'], 6) < 0)
-        $m = $ahccap['mac1'].$ahccap['mac2'];
+    if (strncmp($ahccapx['mac_ap'], $ahccapx['mac_sta'], 6) < 0)
+        $m = $ahccapx['mac_ap'].$ahccapx['mac_sta'];
     else
-        $m = $ahccap['mac2'].$ahccap['mac1'];
+        $m = $ahccapx['mac_sta'].$ahccapx['mac_ap'];
 
-    if (strncmp($ahccap['nonce1'], $ahccap['nonce2'], 6) < 0)
-        $n = $ahccap['nonce1'].$ahccap['nonce2'];
-    else
-        $n = $ahccap['nonce2'].$ahccap['nonce1'];
+    $swap = False;
+    if (strncmp($ahccapx['nonce_sta'], $ahccapx['nonce_ap'], 6) < 0)
+        $n = $ahccapx['nonce_sta'].$ahccapx['nonce_ap'];
+    else {
+        $n = $ahccapx['nonce_ap'].$ahccapx['nonce_sta'];
+        $swap = True;
+    }
 
-    $block = "Pairwise key expansion\0".$m.$n."\0";
+    // get nonce_ap last bytes for nonce correction
+    // TODO: unpack 64bit after April2019, this is PHP 5.6+
+    $last1le = unpack('x24/V', $ahccapx['nonce_ap']);
+    $last2le = unpack('x28/V', $ahccapx['nonce_ap']);
+    $last1be = unpack('x24/N', $ahccapx['nonce_ap']);
+    $last2be = unpack('x28/N', $ahccapx['nonce_ap']);
+
+    $corr['V'] = ($last1le[1] << 32) | $last2le[1];
+    $corr['N'] = ($last1be[1] << 32) | $last2be[1];
+    $halfnc = ($nc >> 1) + 1;
 
     foreach ($keys as $key) {
-        $kl = strlen($key);
-        if (($kl < 8) || ($kl > 64))
-            continue;
+        if (strlen($key) > 20) {
+            $key = hc_unhex($key);
+        }
 
-        $pmk = hash_pbkdf2('sha1', $key, $ahccap['essid'], 4096, 32, True);
+        if (! $pmk) {
+            $kl = strlen($key);
+            if (($kl < 8) || ($kl > 64)) {
+                continue;
+            }
+            $pmk = hash_pbkdf2('sha1', $key, $ahccapx['essid'], 4096, 32, True);
+        }
 
-        $ptk = hash_hmac('sha1', $block, $pmk, True);
+        $ncarr = array(array('N', 0));
+        do {
+            foreach ($ncarr as $j) {
+                $rawlast1 = pack($j[0], $corr[$j[0]] + $j[1] >> 32);
+                $rawlast2 = pack($j[0], $corr[$j[0]] + $j[1]);
 
-        if ($ahccap['keyver'] == 1)
-            $testmic = hash_hmac('md5',  $ahccap['eapol'], substr($ptk, 0, 16), True);
-        else
-            $testmic = hash_hmac('sha1', $ahccap['eapol'], substr($ptk, 0, 16), True);
+                if ($swap) {
+                    $n = substr_replace($n, $rawlast1.$rawlast2, 24, 8);
+                } else {
+                    $n = substr_replace($n, $rawlast1.$rawlast2, 56, 8);
+                }
 
-        if (strncmp($testmic, $ahccap['keymic'], 16) == 0)
-            return $key;
+                switch ($ahccapx['keyver']) {
+                    case 1:
+                        $ptk = hash_hmac('sha1', "Pairwise key expansion\0".$m.$n."\0", $pmk, True);
+                        $testmic = hash_hmac('md5',  $ahccapx['eapol'], substr($ptk, 0, 16), True);
+                        break;
+                    case 2:
+                        $ptk = hash_hmac('sha1', "Pairwise key expansion\0".$m.$n."\0", $pmk, True);
+                        $testmic = hash_hmac('sha1', $ahccapx['eapol'], substr($ptk, 0, 16), True);
+                        break;
+                    case 3:
+                        $ptk = hash_hmac('sha256', "\1\0Pairwise key expansion".$m.$n."\x80\1", $pmk, True);
+                        $testmic = omac1_aes_128($ahccapx['eapol'], substr($ptk, 0, 16));
+                        break;
+                    default:
+                        // unknown keyver
+                        return Null;
+                }
+
+                if (strncmp($testmic, $ahccapx['keymic'], 16) == 0) {
+                    if ($ncarr[0][1] == 0) {
+                        return array($key, 0, Null, $pmk);
+                    } else {
+                        if ($j[0] == 'N') {
+                            return array($key, $j[1], 'BE', $pmk);
+                        } else {
+                            return array($key, $j[1], 'LE', $pmk);
+                        }
+                    }
+                    
+                }
+            }
+            if ($ncarr[0][1] == 0) {
+                $ncarr = array(array('V', 1), array('V', -1), array('N', 1), array('N', -1));
+            } else {
+                $ncarr[0][1] += 1;
+                $ncarr[1][1] -= 1;
+                $ncarr[2][1] += 1;
+                $ncarr[3][1] -= 1;
+            }
+        } while ($ncarr[0][1]<=$halfnc);
+        $pmk = False;
     }
 
-    return NULL;
+    return Null;
 }
 
-//Extract keymic
-function get_mic($hccap) {
-    return substr($hccap, 0x178, 16);
-}
+/*
+    check_key_pmkid(pmkidline contents,
+                     array of keys,
+                     binary PMK to be used)
+    return:  False: bad format;
+             Null: not found
+             array('key_found',
+                    Null,
+                    Null,
+                    PMK)
+    PMKID = HMAC-SHA1-128(PMK, "PMK Name" | MAC_AP | MAC_STA)
+    $pmkidline = PMKID*MAC AP*MAC Station*ESSID
+    All is hex encoded
+*/
 
-//Process submission
-function submission($mysql, $file) {
-    //clean uploaded capture
-    $res = '';
-    $rc  = 0;
-    exec(WPACLEAN.' '.SHM.' '.$file, $res, $rc);
+function check_key_pmkid($pmkidline, $keys, $pmk=False) {
+    // split and check
+    $apmkid = explode('*', $pmkidline, 4);
+    if (count($apmkid) != 4)
+        return False;
 
-    //parse wpaclean output and create references to $incap mic
-    $incap = array();
-    $ref = array('');
-    foreach ($res as $net) {
-        if (strlen($net) > 59) {
-            $mic = hex2bin(substr($net, 26, 32));
-            if (isset($incap[$mic]))
-                continue;
-            $incap[$mic] = array($mic,                          //mic
-                                 mac2long(substr($net, 4, 17)), //ibssid
-                                 substr($net, 59));             //ssid
-            $ref[] = & $incap[$mic][0];
+    // unhex
+    for ($i=0; $i <= 3; $i++) {
+        if (( (bool) (~ strlen($apmkid[$i]) & 1)) &&
+            (ctype_xdigit($apmkid[$i]))) {
+
+            $apmkid[$i] = hex2bin($apmkid[$i]);
+        } else {
+            return False;
         }
     }
-    if (count($incap) == 0) {
-        @unlink($file);
-        return false;
-    }
-    $ref[0] = str_repeat('s',count($incap));
 
-    //get all net_ids of of networks already in the DB
-    $sql = 'SELECT net_id, mic FROM nets WHERE mic IN ('.implode(',', array_fill(0, count($incap), '?')).')';
+    foreach ($keys as $key) {
+        if (strlen($key) > 20) {
+            $key = hc_unhex($key);
+        }
+
+        if (! $pmk) {
+            $kl = strlen($key);
+            if (($kl < 8) || ($kl > 64)) {
+                continue;
+            }
+            $pmk = hash_pbkdf2('sha1', $key, $apmkid[3], 4096, 32, True);
+        }
+
+        // compute PMKID candidate
+        $testpmkid = hash_hmac('sha1', 'PMK Name' . $apmkid[1] . $apmkid[2], $pmk, True);
+
+        if (strncmp($testpmkid, $apmkid[0], 16) == 0) {
+            return array($key, Null, Null, $pmk);
+        }
+        $pmk = False;
+    }
+
+    return Null;
+}
+
+//Extract partial md5 hash over hccapx struct
+function hccapx_hash(& $hccapx) {
+    //TODO: implement partial md5_64()
+    return md5(substr($hccapx, 0x09), True);
+}
+
+// Create filesystem lock file or wait until we can create one
+// Proceed if the lockfile is older than 1 minute
+function create_lock($lockfile) {
+    while (file_exists(SHM.$lockfile) && (time()-filemtime(SHM.$lockfile) <= 60)) {
+        sleep(1);
+    }
+    touch(SHM.$lockfile);
+}
+
+// Release filesystem lock file if exists
+function release_lock($lockfile) {
+    if (file_exists(SHM.$lockfile)) {
+        @unlink(SHM.$lockfile);
+    }
+}
+
+// Get handshakes/PMKIDs by ssid, bssid, mac_sta
+function get_handshakes(& $mysql, & $stmt, $ssid, $bssid, $mac_sta, $n_state) {
+    if ($stmt == Null) {
+        $stmt = $mysql->stmt_init();
+        $stmt->prepare('SELECT net_id, struct, ssid, pass, nc, bssid, mac_sta, pmk, sip, keyver, algo
+FROM nets
+WHERE (ssid=? OR bssid=? OR mac_sta=?)
+AND n_state=?');
+    }
+
+    $stmt->bind_param('siii', $ssid, $bssid, $mac_sta, $n_state);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $res = $result->fetch_all(MYSQLI_ASSOC);
+    $result->free();
+
+    return $res;
+}
+
+// Update cracked handshake by hash
+function submit_by_hash(& $mysql, & $stmt, $pass, $pmk, $nc, $endian, $sip, $algo, $hash) {
+    if ($stmt == Null) {
+        $stmt = $mysql->stmt_init();
+        $stmt->prepare('UPDATE nets SET pass=?, pmk=?, nc=?, endian=?, sip=?, algo=?, sts=NOW(), n_state=1 WHERE hash=?');
+    }
+
+    $stmt->bind_param('ssisiss', $pass, $pmk, $nc, $endian, $sip, $algo, $hash);
+    $stmt->execute();
+
+    return;
+}
+
+// Delete from n2d by hash
+function delete_from_n2d_by_hash(& $mysql, & $stmt, $hash) {
+    if ($stmt == Null) {
+        $stmt = $mysql->stmt_init();
+        $stmt->prepare('DELETE FROM n2d WHERE net_id=(SELECT net_id FROM nets WHERE hash=?)');
+    }
+
+    $stmt->bind_param('s', $hash);
+    $stmt->execute();
+
+    return;
+}
+
+// Look for duplicate handshakes and mark submission array
+function duplicate_nets(& $mysql, & $ref, & $nets) {
+    if (count($ref) < 2) {
+        return;
+    }
+
+    //get all net_ids of networks already in the DB
+    $sql = 'SELECT hash FROM nets WHERE hash IN ('.implode(',', array_fill(0, count($ref)-1, '?')).')';
     $stmt = $mysql->stmt_init();
     $stmt->prepare($sql);
+
+    $ref[0] = str_repeat('s', count($ref)-1);
     call_user_func_array(array($stmt, 'bind_param'), $ref);
     $stmt->execute();
     stmt_bind_assoc($stmt, $data);
     while ($stmt->fetch()) {
-        $incap[$data['mic']][] = $data['net_id'];
+        //place skip mark - we have it in the db
+        $nets[$data['hash']][100] = '';
     }
     $stmt->close();
-
-    //get u_id if we have key set
-    $u_id = Null;
-    if (isset($_COOKIE['key']))
-        if (valid_key($_COOKIE['key'])) {
-            $sql = 'SELECT u_id FROM users WHERE userkey=UNHEX(?)';
-            $stmt = $mysql->stmt_init();
-            $stmt->prepare($sql);
-            $stmt->bind_param('s', $_COOKIE['key']);
-            $stmt->execute();
-            $stmt->bind_result($u_id);
-            $stmt->fetch();
-            $stmt->close();
-        }
-
-    // Prepare nets for import
-    $sql = 'INSERT IGNORE INTO nets(bssid, ssid, ip, mic, cap, hccap) VALUES(?, ?, ?, ?, ?, ?)';
-    $stmt = $mysql->stmt_init();
-    $stmt->prepare($sql);
-
-    // Prepare n2u for insert
-    if ($u_id != Null) {
-        $n2usql = 'INSERT IGNORE INTO n2u(net_id, u_id) VALUES(?, ?)';
-        $n2ustmt = $mysql->stmt_init();
-        $n2ustmt->prepare($n2usql);
-    }
-
-    //BEGIN TRANSACTION
-    $mysql->autocommit(FALSE);
-    foreach ($incap as $net) {
-        //associate net with user
-        if (isset($net[3])) {
-            if ($u_id != Null) {
-                $n2ustmt->bind_param('ii', $net[3], $u_id);
-                $n2ustmt->execute();
-            }
-            continue;
-        }
-        $dotmac = long2mac($net[1]);
-
-        $bnfile = SHM.bin2hex($net[0]).'.mic.cap';
-        if (! file_exists($bnfile)) {
-            file_put_contents('shitlog.txt', "$bnfile not exists, continue...", FILE_APPEND);
-            continue;
-        }
-        //run through pyrit analyze
-        $cut = '';
-        $rc  = 0;
-        exec(PYRIT.' -r '.$bnfile.' analyze', $cut, $rc);
-        //check for correct errorcode and if we have only one AP
-        if (($rc == 0) && (strpos(implode("\n", $cut), 'got 1 AP(s)') !== FALSE)) {
-            //generate hccap
-            $cut = '';
-            exec(CAP2HCCAP." $bnfile $bnfile.hccap", $cut, $rc);
-            if (($rc == 0) && filesize("$bnfile.hccap") == 392) {
-                //we are OK, read data
-                $cap = file_get_contents($bnfile);
-                $gzcap = gzencode($cap, 9);
-                $hccap = file_get_contents("$bnfile.hccap");
-                $gzhccap = gzencode($hccap, 9);
-                //extract mic
-                $mic = get_mic($hccap);
-                if ($mic != $net[0]) {
-                    file_put_contents('shitlog.txt', print_r($net, True), FILE_APPEND);
-                }
-                //put in db
-                $ip = ip2long($_SERVER['REMOTE_ADDR']);
-                $stmt->bind_param('isisss', $net[1], $net[2], $ip, $net[0], $gzcap, $gzhccap);
-                $stmt->execute();
-                $net_id = $mysql->insert_id;
-                if (($u_id != Null) && ($net_id != 0)) {
-                    $n2ustmt->bind_param('ii', $net_id, $u_id);
-                    $n2ustmt->execute();
-                }
-            }
-            @unlink("$bnfile.hccap");
-        }
-    }
-    $stmt->close();
-
-    chmod($file, 0644);
-    move_uploaded_file($file, CAP.$_SERVER['REMOTE_ADDR'].'-'.md5_file($file).'.cap');
-
-    //update net count stats
-    $mysql->query("UPDATE stats SET pvalue = (SELECT count(net_id) FROM nets) WHERE pname='nets'");
-    $mysql->query("UPDATE stats SET pvalue = (SELECT count(DISTINCT bssid) FROM nets) WHERE pname='nets_unc'");
-
-    $mysql->commit();
-
-    foreach ($incap as $net) {
-        @unlink(SHM.bin2hex($net[0]).'.mic.cap');
-    }
-
-    return true;
 }
 
-//Put work
-function put_work($mysql) {
-    if (empty($_POST))
-        return false;
+// Handshake import
+function insert_nets(& $mysql, & $ref) {
+    if (count($ref) < 2) {
+        return;
+    }
 
-    //get nets by bssid
-    $sql = 'SELECT net_id, hccap FROM nets WHERE bssid = ? AND n_state=0';
+    $bindvars = 'iiisssii';
+    $sql = 'INSERT IGNORE INTO nets(s_id, bssid, mac_sta, ssid, hash, struct, message_pair, keyver) VALUES'.implode(',', array_fill(0, (count($ref)-1)/strlen($bindvars), '('.implode(',',array_fill(0, strlen($bindvars), '?')).')'));
     $stmt = $mysql->stmt_init();
     $stmt->prepare($sql);
-    $data = array();
-    stmt_bind_assoc($stmt, $data);
 
-    //get net by nhash
-    $nsql = 'SELECT net_id, hccap FROM nets WHERE mic = unhex(?) AND n_state=0';
-    $nstmt = $mysql->stmt_init();
-    $nstmt->prepare($nsql);
-    $ndata = array();
-    stmt_bind_assoc($nstmt, $ndata);
+    $ref[0] = str_repeat($bindvars, (count($ref)-1)/strlen($bindvars));
+    call_user_func_array(array($stmt, 'bind_param'), $ref);
+    $stmt->execute();
+    $stmt->close();
+}
 
-    //Update key stmt
-    $usql = 'UPDATE nets SET pass=?, sip=?, n_state=1, sts=NOW() WHERE net_id=?';
-    $ustmt = $mysql->stmt_init();
-    $ustmt->prepare($usql);
+// Associate handshake to user
+function insert_n2u(& $mysql, & $ref, $u_id) {
+    if (count($ref) < 2) {
+        return;
+    }
 
-    $mcount = 0;
-    foreach ($_POST as $bssid_or_mic => $key) {
-        if (strlen($key) < 8)
-            continue;
-        if (valid_mac($bssid_or_mic)) {
-            //old style submission with bssid
-            $ibssid = mac2long($bssid_or_mic);
-            $stmt->bind_param('i', $ibssid);
-            $stmt->execute();
+    $sql = "INSERT IGNORE INTO n2u(net_id, u_id) SELECT net_id, $u_id FROM nets WHERE hash IN (".implode(',', array_fill(0, count($ref)-1, '?')).')';
+    $stmt = $mysql->stmt_init();
+    $stmt->prepare($sql);
 
-            while ($stmt->fetch()) {
-                $hccap = gzinflate(substr($data['hccap'], 10));
-                if ($key == check_key($hccap, array($key))) {
-                    //put result in nets
-                    $stmt->free_result();
-                    $iip = ip2long($_SERVER['REMOTE_ADDR']);
-                    $net_id = $data['net_id'];
-                    $ustmt->bind_param('sii', $key, $iip, $net_id);
-                    $ustmt->execute();
-                    //delete from n2d
-                    $mysql->query("DELETE FROM n2d WHERE net_id=$net_id");
-                }
+    $ref[0] = str_repeat('s', count($ref)-1);
+    call_user_func_array(array($stmt, 'bind_param'), $ref);
+    $stmt->execute();
+    $stmt->close();
+}
+
+// Process submission
+function submission($mysql, $file) {
+    // extract handshakes and PMKIDs from uploaded capture
+    $hccapxfile = tempnam(SHM, 'hccapx');
+    $pmkidfile = tempnam(SHM, 'pmkid');
+    $res = '';
+    $rc  = 0;
+    exec(HCXPCAPTOOL." --nonce-error-corrections=128 --time-error-corrections=10000 -o $hccapxfile -z $pmkidfile $file 2>&1", $res, $rc);
+
+    // do we have error condition?
+    if ($rc != 0) {
+        @unlink($file);
+        return "Capture processing error. Exit code $rc. Please inform developers.";
+    }
+
+    // add submission
+    if (file_exists($hccapxfile) || file_exists($pmkidfile)) {
+        //move uploaded cap file
+        $partial_path = date('Y/m/d/');
+        if (!is_dir(CAP.$partial_path)) {
+            mkdir(CAP.$partial_path, 0777, True);
+        }
+        chmod($file, 0644);
+        $capfile = CAP.$partial_path.$_SERVER['REMOTE_ADDR'].'-'.md5_file($file).'.cap';
+        move_uploaded_file($file, $capfile);
+
+        //insert into submissions table
+        $sql = 'INSERT IGNORE INTO submissions(localfile, ip) VALUES(?, ?)';
+        $stmt = $mysql->stmt_init();
+        $stmt->prepare($sql);
+        $ip = ip2long($_SERVER['REMOTE_ADDR']);
+        $stmt->bind_param('si', $capfile, $ip);
+        $stmt->execute();
+        $s_id = $stmt->insert_id;
+        $stmt->close();
+
+        $userkey = (isset($_COOKIE['key']) && valid_key($_COOKIE['key'])) ? $_COOKIE['key'] : '';
+        if ($s_id == False && $userkey == '') {
+            @unlink($hccapxfile);
+            @unlink($pmkidfile);
+            return 'This capture file was already submitted.';
+        }
+    } else {
+        @unlink($file);
+        return "No valid handshakes/PMKIDs found in submitted file.";
+    }
+
+    $nets = array();
+    $ref = array('');
+
+    // read hccapx file
+    if (file_exists($hccapxfile)
+        && filesize($hccapxfile) != 0
+        && filesize($hccapxfile) % 393 == 0) {
+        $fp = fopen($hccapxfile, 'rb');
+        while (($hccapx = fread($fp, 393)) != False) {
+            $hash = hccapx_hash($hccapx);
+            if (isset($nets[$hash])) {
+                continue;
             }
-        } elseif (valid_key($bssid_or_mic)) {
-            //hash submission
-            $mic = strtolower($bssid_or_mic);
-            $nstmt->bind_param('s', $mic);
-            $nstmt->execute();
-
-            if ($nstmt->fetch()) {
-                $hccap = gzinflate(substr($ndata['hccap'], 10));
-                if ($key == check_key($hccap, array($key))) {
-                    //put result in nets
-                    $nstmt->free_result();
-                    $iip = ip2long($_SERVER['REMOTE_ADDR']);
-                    $net_id = $ndata['net_id'];
-                    $ustmt->bind_param('sii', $key, $iip, $net_id);
-                    $ustmt->execute();
-                    //delete from n2d
-                    $mysql->query("DELETE FROM n2d WHERE net_id=$net_id");
-                }
+            $nets[$hash] = array($hash, $hccapx, 0);
+            $ref[] = & $nets[$hash][0];
+            if (count($ref) > 1000) {
+                duplicate_nets($mysql, $ref, $nets);
+                $ref = array('');
             }
         }
-        if ($mcount++ > 20)
+        fclose($fp);
+        @unlink($hccapxfile);
+        duplicate_nets($mysql, $ref, $nets);
+        $ref = array('');
+    }
+
+    // read pmkid file
+    if (file_exists($pmkidfile)
+        && filesize($pmkidfile) > 0) {
+        $fp = fopen($pmkidfile, 'r');
+        while (($pmkidline = fgets($fp)) != False) {
+            $pmkidline = rtrim($pmkidline);
+            // validate PMKID line
+            $apmkid = explode('*', $pmkidline, 4);
+            if (count($apmkid) != 4) {
+                continue;
+            }
+            for ($i=0; $i <= 3; $i++) {
+                if ( !(((bool) (~ strlen($apmkid[$i]) & 1)) && (ctype_xdigit($apmkid[$i]))) ) {
+                    continue;
+                }
+            }
+            // get hash from PMKID*mac_ap*mac_sta
+            $hash = md5(substr($pmkidline, 0, 58), True);
+            if (isset($nets[$hash])) {
+                continue;
+            }
+            $nets[$hash] = array($hash, $pmkidline, 1);
+            $ref[] = & $nets[$hash][0];
+            if (count($ref) > 1000) {
+                duplicate_nets($mysql, $ref, $nets);
+                $ref = array('');
+            }
+        }
+        fclose($fp);
+        @unlink($pmkidfile);
+        duplicate_nets($mysql, $ref, $nets);
+        $ref = array('');
+    }
+
+    // insert identified handshakes/PMKIDs
+    $zpmk = str_repeat("\0", 32);
+    $pmkarr = array();
+    if ($s_id != False) {
+        $refi = array('');
+        $hs_stmt = Null;
+        foreach ($nets as &$net) {
+            // do we have a skip mark?
+            if (array_key_exists(100, $net)) {
+                continue;
+            }
+
+            // read from hccapx struct
+            if ($net[2] == 0) {
+                $essid_len = ord(substr($net[1], 0x09, 1));
+                if (version_compare(PHP_VERSION, '5.5.0') >= 0) {
+                    $essid      = unpack('Z32', substr($net[1], 0x0a, 32));
+                } else {
+                    $essid      = unpack('a32', substr($net[1], 0x0a, 32));
+                }
+                $essid = substr($essid[1], 0, $essid_len);
+                $message_pair = ord(substr($net[1], 0x08, 1));
+                $keyver = ord(substr($net[1], 0x2a, 1));
+
+                $mac_ap = unpack('H*', substr($net[1], 0x3b, 6));
+                $mac_ap = hexdec($mac_ap[1]);
+
+                $mac_sta = unpack('H*', substr($net[1], 0x61, 6));
+                $mac_sta = hexdec($mac_sta[1]);
+            }
+
+            // read from pmkid hash line
+            if ($net[2] == 1) {
+                $apmkid = explode('*', $net[1], 4);
+
+                $mac_ap = hexdec($apmkid[1]);
+                $mac_sta = hexdec($apmkid[2]);
+                $essid = hex2bin($apmkid[3]);
+
+                $message_pair = Null;
+                $keyver = 100;
+            }
+
+
+            $net[2] = $mac_ap;
+            $net[3] = $essid;
+            $net[4] = $message_pair;
+            $net[5] = $keyver;
+            $net[6] = $mac_sta;
+
+            // check for zeroed PMK
+            if ($keyver == 100) {
+                $reshs = check_key_pmkid($net[1], array(''), $zpmk);
+            } else {
+                $reshs = check_key_hccapx($net[1], array(''), 128*2, $zpmk);
+            }
+            if ($reshs) {
+                // this is zeroed PMK
+                $pmkarr[$net[0]] = array('key' => '',
+                                         'pmk' => $zpmk,
+                                         'nc' => $reshs[1],
+                                         'endian' => $reshs[2],
+                                         'sip' => 2130706433,
+                                         'algo' => 'ZeroPMK');
+            } else {
+                // look for cracked handshakes/PMKIDs with same features and try to crack current by PMK
+                $broken_essid = False;
+                $hss = get_handshakes($mysql, $hs_stmt, $essid, $mac_ap, $mac_sta, 1);
+                foreach ($hss as $hs) {
+                    if ($keyver == 100) {
+                        $reshs = check_key_pmkid($net[1], array($hs['pass']), $hs['pmk']);
+                    } else {
+                        $reshs = check_key_hccapx($net[1], array($hs['pass']), abs($hs['nc'])*2+128, $hs['pmk']);
+                    }
+                    if ($reshs) {
+                        // we cracked that by PMK, now let's check if essid matches
+                        // if this not pass, we have broken essid and we'll skip this net.
+                        if ($essid === $hs['ssid']) {
+                            $pmkarr[$net[0]] = array('key' => $reshs[0],
+                                                     'pmk' => $hs['pmk'],
+                                                     'nc' => $reshs[1],
+                                                     'endian' => $reshs[2],
+                                                     'sip' => $hs['sip'],
+                                                     'algo' => $hs['algo']);
+                        } else {
+                            $broken_essid = True;
+                        }
+                        break;
+                    }
+                }
+
+                if ($broken_essid) {
+                    continue;
+                }
+            }
+
+            // prepare values for insert
+            $refi[] = & $s_id;
+            $refi[] = & $net[2];
+            $refi[] = & $net[6];
+            $refi[] = & $net[3];
+            $refi[] = & $net[0];
+            $refi[] = & $net[1];
+            $refi[] = & $net[4];
+            $refi[] = & $net[5];
+
+            if (count($refi) > 1000) {
+                insert_nets($mysql, $refi);
+                $refi = array('');
+            }
+        }
+        if ($hs_stmt) {
+            $hs_stmt->close();
+        }
+        insert_nets($mysql, $refi);
+        $refi = array('');
+
+    }
+
+    // associate nets to user if we have key submitted
+    if ($userkey != '') {
+        $u_id = Null;
+        $stmt = $mysql->stmt_init();
+        $stmt->prepare('SELECT u_id FROM users WHERE userkey=UNHEX(?)');
+        $stmt->bind_param('s', $userkey);
+        $stmt->execute();
+        $stmt->bind_result($u_id);
+        $stmt->fetch();
+        $stmt->close();
+
+        //associate handshakes to user
+        if ($u_id != Null) {
+            $ref = array('');
+            foreach ($nets as $net) {
+                $ref[] = & $net[0];
+                if (count($ref) > 1000) {
+                    insert_n2u($mysql, $ref, $u_id);
+                    $ref = array('');
+                }
+            }
+            insert_n2u($mysql, $ref, $u_id);
+            $ref = array();
+        }
+    }
+
+    // update nets cracked by PMK
+    if (!empty($pmkarr)) {
+        $submit_stmt = Null;
+        $n2d_stmt = Null;
+        foreach ($pmkarr as $hash => $val) {
+            submit_by_hash($mysql, $submit_stmt, $val['key'], $val['pmk'], $val['nc'], $val['endian'], $val['sip'], $val['algo'], $hash);
+            delete_from_n2d_by_hash($mysql, $n2d_stmt, $hash);
+        }
+        $submit_stmt->close();
+        $n2d_stmt->close();
+
+        // update cracked net stats
+        $mysql->query("UPDATE stats SET pvalue = (SELECT count(net_id) FROM nets WHERE n_state=1) WHERE pname='cracked'");
+        $mysql->query("UPDATE stats SET pvalue = (SELECT count(DISTINCT bssid) FROM nets WHERE n_state=1) WHERE pname='cracked_unc'");
+        $mysql->query("UPDATE stats SET pvalue = (SELECT count(net_id) FROM nets WHERE n_state=1 AND keyver=100) WHERE pname='cracked_pmkid'");
+        $mysql->query("UPDATE stats SET pvalue = (SELECT count(DISTINCT bssid) FROM nets WHERE n_state=1 AND keyver=100) WHERE pname='cracked_pmkid_unc'");
+    }
+
+    // update handshake stats
+    $mysql->query("UPDATE stats SET pvalue = (SELECT count(net_id) FROM nets) WHERE pname='nets'");
+    $mysql->query("UPDATE stats SET pvalue = (SELECT count(DISTINCT bssid) FROM nets) WHERE pname='nets_unc'");
+    $mysql->query("UPDATE stats SET pvalue = (SELECT count(net_id) FROM nets WHERE keyver=100) WHERE pname='pmkid'");
+    $mysql->query("UPDATE stats SET pvalue = (SELECT count(DISTINCT bssid) FROM nets WHERE keyver=100) WHERE pname='pmkid_unc'");
+
+    return implode("\n", $res);
+}
+
+// Get uncracked net by bssid
+function by_bssid(& $mysql, & $stmt, $bssid) {
+    if ($stmt == Null) {
+        $stmt = $mysql->stmt_init();
+        $stmt->prepare('SELECT net_id, struct, ssid, bssid, mac_sta, keyver FROM nets WHERE bssid = ? AND n_state=0');
+    }
+
+    $ibssid = mac2long($bssid);
+    $stmt->bind_param('i', $ibssid);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $res = $result->fetch_all(MYSQLI_ASSOC);
+    $result->free();
+
+    return $res;
+}
+
+// Get uncracked net by hash
+function by_hash(& $mysql, & $stmt, $hash) {
+    if ($stmt == Null) {
+        $stmt = $mysql->stmt_init();
+        $stmt->prepare('SELECT net_id, struct, ssid, bssid, mac_sta, keyver FROM nets WHERE hash = UNHEX(?) AND n_state=0');
+    }
+    $stmt->bind_param('s', $hash);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $res = $result->fetch_all(MYSQLI_ASSOC);
+    $result->free();
+
+    return $res;
+}
+
+// Update results by net_id
+function submit_by_net_id(& $mysql, & $stmt, $pass, $pmk, $nc, $endian, $sip, $net_id) {
+    if ($stmt == Null) {
+        $stmt = $mysql->stmt_init();
+        $stmt->prepare('UPDATE nets SET pass=?, pmk=?, nc=?, endian=?, sip=?, sts=NOW(), n_state=1 WHERE net_id=?');
+    }
+
+    $stmt->bind_param('ssisii', $pass, $pmk, $nc, $endian, $sip, $net_id);
+    $stmt->execute();
+
+    return;
+}
+
+// Remove records from n2d for cracked handshake
+function delete_from_n2d(& $mysql, & $stmt, $net_id) {
+    if ($stmt == Null) {
+        $stmt = $mysql->stmt_init();
+        $stmt->prepare('DELETE FROM n2d WHERE net_id=?');
+    }
+
+    $stmt->bind_param('i', $net_id);
+    $stmt->execute();
+
+    return;
+}
+
+// Deletes from rkg, n2u, n2d, and nets by net_id
+// This is used to remove handshakes/PMKIDs with broken essids
+function delete_cascade_by_net_id(& $mysql, $net_id) {
+    $stmt = $mysql->stmt_init();
+    $stmt->prepare('DELETE FROM rkg WHERE net_id=?');
+    $stmt->bind_param('i', $net_id);
+    $stmt->execute();
+    $stmt->close();
+    $stmt = $mysql->stmt_init();
+    $stmt->prepare('DELETE FROM n2u WHERE net_id=?');
+    $stmt->bind_param('i', $net_id);
+    $stmt->execute();
+    $stmt->close();
+    $stmt = $mysql->stmt_init();
+    $stmt->prepare('DELETE FROM n2d WHERE net_id=?');
+    $stmt->bind_param('i', $net_id);
+    $stmt->execute();
+    $stmt->close();
+    $stmt = $mysql->stmt_init();
+    $stmt->prepare('DELETE FROM nets WHERE net_id=?');
+    $stmt->bind_param('i', $net_id);
+    $stmt->execute();
+    $stmt->close();
+
+    return;
+}
+
+// Put work
+function put_work($mysql, $candidates) {
+    if (empty($candidates)) {
+        return False;
+    }
+
+    $bybssid_stmt = Null;
+    $byhash_stmt = Null;
+    $submit_stmt = Null;
+    $n2d_stmt = Null;
+    $hs_stmt = Null;
+
+    $mcount = 0;
+    foreach ($candidates as $bssid_or_hash => $key) {
+        if (strlen($key) < 8) {
+            continue;
+        }
+
+        // remove bssid padding if found
+        if (strlen($bssid_or_hash) == 21) {
+            $bssid_or_hash = substr($bssid_or_hash, -17);
+        }
+
+        // get nets by bssid or hash
+        if (valid_mac($bssid_or_hash)) {
+            $nets = by_bssid($mysql, $bybssid_stmt, $bssid_or_hash);
+        } elseif (valid_key($bssid_or_hash)) {
+            $nets = by_hash($mysql, $byhash_stmt, $bssid_or_hash);
+        } else {
+            continue;
+        }
+
+        // check PSK candidate against struct
+        foreach ($nets as $net) {
+            if ($net['keyver'] == 100) {
+                $res = check_key_pmkid($net['struct'], array($key));
+            } else {
+                $res = check_key_hccapx($net['struct'], array($key));
+            }
+
+            if ($res) {
+                $iip = ip2long($_SERVER['REMOTE_ADDR']);
+                submit_by_net_id($mysql, $submit_stmt, $res[0], $res[3], $res[1], $res[2], $iip, $net['net_id']);
+                delete_from_n2d($mysql, $n2d_stmt, $net['net_id']);
+
+                // check for other crackable nets by PMK
+                $broken_essid = False;
+                $hss = get_handshakes($mysql, $hs_stmt, $net['ssid'], $net['bssid'], $net['mac_sta'], 0);
+                foreach ($hss as $hs) {
+                    if ($hs['keyver'] == 100) {
+                        $reshs = check_key_pmkid($hs['struct'], array($key), $res[3]);
+                    } else {
+                        $reshs = check_key_hccapx($hs['struct'], array($key), abs($res[1])*2+128, $res[3]);
+                    }
+                    if ($reshs) {
+                        // we cracked that by PMK, now let's check if essid matches
+                        // if this not pass, we have broken essid and we'll delete this net.
+                        if ($net['ssid'] === $hs['ssid']) {
+                            submit_by_net_id($mysql, $submit_stmt, $res[0], $res[3], $reshs[1], $reshs[2], $iip, $hs['net_id']);
+                            delete_from_n2d($mysql, $n2d_stmt, $hs['net_id']);
+                        } else {
+                            delete_cascade_by_net_id($mysql, $hs['net_id']);
+                        }
+                    }
+
+                }
+
+            }
+        }
+
+        if ($mcount++ > 200)
             break;
     }
-    $stmt->close();
-    $ustmt->close();
-    $nstmt->close();
 
-    //Update cracked net stats
+    // cleanup stmts
+    if ($bybssid_stmt) {
+        $bybssid_stmt->close();
+    }
+    if ($byhash_stmt) {
+        $byhash_stmt->close();
+    }
+    // if we haven't accepted valid PSK just exit
+    if (!$submit_stmt) {
+        return False;
+    }
+    $submit_stmt->close();
+    if ($hs_stmt) {
+        $hs_stmt->close();
+    }
+    $n2d_stmt->close();
+
+    // update cracked net stats
     $mysql->query("UPDATE stats SET pvalue = (SELECT count(net_id) FROM nets WHERE n_state=1) WHERE pname='cracked'");
     $mysql->query("UPDATE stats SET pvalue = (SELECT count(DISTINCT bssid) FROM nets WHERE n_state=1) WHERE pname='cracked_unc'");
+    $mysql->query("UPDATE stats SET pvalue = (SELECT count(net_id) FROM nets WHERE n_state=1 AND keyver=100) WHERE pname='cracked_pmkid'");
+    $mysql->query("UPDATE stats SET pvalue = (SELECT count(DISTINCT bssid) FROM nets WHERE n_state=1 AND keyver=100) WHERE pname='cracked_pmkid_unc'");
 
-    //Create new cracked.txt.gz and update wcount
-    $sql = 'SELECT pass FROM (SELECT pass, count(pass) AS c FROM nets WHERE n_state=1 GROUP BY pass) i ORDER BY i.c DESC';
+    // pull cracked wordlist
     $stmt = $mysql->stmt_init();
-    $stmt->prepare($sql);
-    $data = array();
-    stmt_bind_assoc($stmt, $data);
+    $stmt->prepare("SELECT BINARY pass AS pass
+FROM (SELECT bssid, BINARY pass AS pass
+      FROM nets
+      WHERE n_state=1 AND
+      (algo IS NULL OR algo = '') AND
+      LENGTH(pass) >= 8
+      GROUP BY bssid, BINARY pass) t
+GROUP BY BINARY pass
+ORDER BY count(pass) DESC");
     $stmt->execute();
-    $wl = '';
-    $i = 0;
+    $stmt->bind_result($key);
+
+    // write compressed wordlist
+    $wpakeys = tempnam(SHM, 'wpakeys');
+    chmod($wpakeys, 0644);
+    $fd = gzopen($wpakeys, 'wb9');
     while ($stmt->fetch()) {
-        $wl = "$wl{$data['pass']}\n";
-        $i += 1;
+        gzwrite($fd, "$key\n");
     }
+    $keycount = $stmt->num_rows;
     $stmt->close();
+    fflush($fd);
+    gzclose($fd);
 
-    $gzdata    = gzencode($wl, 9);
-    $md5gzdata = md5($gzdata, True);
-    
-    $sem = sem_get(888);
-    sem_acquire($sem);
-    file_put_contents(CRACKED, $gzdata);
-    sem_release($sem);
+    $md5 = md5_file($wpakeys, True);
+    rename($wpakeys, CRACKED);
 
-    //update wcount for cracked dict
+    // update wcount for cracked dict
     $cr = '%'.basename(CRACKED);
     $sql = 'UPDATE dicts SET wcount = ?, dhash = ? WHERE dpath LIKE ?';
     $stmt = $mysql->stmt_init();
     $stmt->prepare($sql);
-    $stmt->bind_param('iss', $i, $md5gzdata, $cr);
+    $stmt->bind_param('iss', $keycount, $md5, $cr);
     $stmt->execute();
     $stmt->close();
 
-    return true;
+    return True;
 }
 
-//MAC conversions and checks
+// MAC conversions and checks
 function mac2long($mac) {
     return hexdec(str_replace(':', '', $mac));
 }
@@ -402,19 +910,19 @@ function valid_mac($mac, $part=6) {
     return preg_match('/^([a-f0-9]{2}\:?){'.$part.'}$/', strtolower($mac));
 }
 
-//Generate random key
+// Generate random key
 function gen_key() {
-    $fp = fopen('/dev/random','rb');
+    $fp = fopen('/dev/urandom','rb');
     $rand = fread($fp, 32);
     fclose($fp);
     return md5($rand);
 }
 
 /*
-Validate an email address.
-Provide email address (raw input)
-Returns true if the email address has the email 
-address format and the domain exists.
+    Validate an email address.
+    Provide email address (raw input)
+    Returns true if the email address has the email
+    address format and the domain exists.
 */
 function validEmail($email) {
 	$isValid = true;
@@ -459,7 +967,7 @@ function validEmail($email) {
 	return $isValid;
 }
 
-//convert num
+// Convert num
 function convert_num($num) {
     $num = (float) $num;
     if ($num >= 1000000000000) {
@@ -479,7 +987,7 @@ function convert_num($num) {
     return $size;
 }
 
-//convert seconds to text
+// Convert seconds to text
 function convert_sec($secs) {
     $units = array (
         'year'   => 29030400, // seconds in a year   (12 months)
@@ -496,43 +1004,52 @@ function convert_sec($secs) {
             $secs -= intval($secs / $mult) * $mult;
         }
 
-    //remove leading ,
+    // remove leading ,
     return substr($output, 2);
 }
 
-//Write nets table
-function write_nets($stmt, $data) {
-    $has_input = false;
+// Write nets table
+function write_nets($datas) {
+    $has_input = False;
     echo '
-<style>
+<style type="text/css">
 td {padding-left: 7px; padding-right: 7px}
 </style>
-<script type="text/javascript">
-function goWigle(bssid) {
-    document.getElementById("netid").value = bssid;
-    document.getElementById("wigle").submit();
-}
-</script>
-<form method="POST" action="https://www.wigle.net/gps/gps/main/confirmquery" target="_blank" id="wigle" >
-<input type="hidden" name="netid" id="netid" />
-</form>
-<form class="form" method="POST" action="?nets" enctype="multipart/form-data">
+<form class="form" method="post" action="?nets" enctype="multipart/form-data">
 <table style="border: 1;">
-<tr><th>BSSID</th><th>SSID</th><th>WPA key</th><th>Get works</th><th>Timestamp</th></tr>';
-    while ($stmt->fetch()) {
+<tr><th>BSSID</th><th>SSID</th><th>Type</th><th>WPA key</th><th>Get works</th><th>Timestamp</th></tr>';
+    foreach ($datas as $data) {
         $bssid = long2mac($data['bssid']);
-        $mic = $data['mic'];
+        $hash = $data['hash'];
         $ssid = htmlspecialchars($data['ssid']);
-        if ($data['pass'] == '') {
-            $pass = '<input class="input" type="text" name="'.$mic.'" size="20"/>';
-            $has_input = true;
-        } else
+        if ($data['n_state'] == 0) {
+            $pass = '<input class="input" type="text" name="'.$hash.'" size="20"/>';
+            $has_input = True;
+        } else {
             $pass = htmlspecialchars($data['pass']);
-        echo "<tr><td style=\"font-family:monospace; font-size: 12px; cursor: pointer; \"><a title=\"Wigle geo query. You must be logged in.\" onclick=\"goWigle(this.text)\">$bssid</a></td><td>$ssid</td><td>$pass</td><td align=\"right\">{$data['hits']}</td><td>{$data['ts']}</td></tr>\n";
+        }
+        switch ($data['keyver']) {
+            case 1:
+                $type = 'WPA';
+                break;
+            case 2:
+                $type = 'WPA2';
+                break;
+            case 3:
+                $type = 'WPA2_11w';
+                break;
+            case 100:
+                $type = 'PMKID';
+                break;
+            default:
+                $type = 'UNC';
+        }
+        echo "<tr><td style=\"font-family:monospace; font-size: 12px; cursor: pointer; \"><a title=\"Wigle geo query. You must be logged in.\" href=\"https://wigle.net/search?netid=$bssid\">$bssid</a></td><td>$ssid</td><td>$type</td><td>$pass</td><td align=\"right\">{$data['hits']}</td><td>{$data['ts']}</td></tr>\n";
     }
     echo '</table>';
-    if ($has_input)
+    if ($has_input) {
         echo '<input class="submitbutton" type="submit" value="Send WPA keys" />';
+    }
     echo '</form>';
 }
 ?>

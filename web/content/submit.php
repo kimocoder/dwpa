@@ -33,8 +33,8 @@ function check_key() {
     if ($_FILES['webfile']['tmp_name'] != '') {
         require_once('db.php');
         require_once('common.php');
-        if (submission($mysql, $_FILES['webfile']['tmp_name']))
-            echo 'Capture submitted successfully';
+        if ($res = submission($mysql, $_FILES['webfile']['tmp_name']))
+            echo "<pre>$res</pre>";
         else
             echo 'Bad capture file';
         $mysql->close();
