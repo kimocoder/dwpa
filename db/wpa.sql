@@ -7,6 +7,37 @@ SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
 -- --------------------------------------------------------
 
 --
+-- Table structure for table `bssids`
+--
+
+
+CREATE TABLE IF NOT EXISTS `bssids` (
+  `bssid` bigint(15) UNSIGNED NOT NULL COMMENT 'BSSID of the network',
+  `ts` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Record timestamp',
+  `flags` tinyint(3) UNSIGNED NOT NULL DEFAULT '0' COMMENT 'Bitflags, positions: 1 - 3wifi hit, 2 - wigle hit',
+  `wifi3ts` timestamp NULL DEFAULT NULL COMMENT 'Last check for PSK in 3wifi DB',
+  `wiglets` timestamp NULL DEFAULT NULL COMMENT 'Last check for location in wigle DB',
+  `lat` decimal(10,8) DEFAULT NULL COMMENT 'Latitude',
+  `lon` decimal(11,8) DEFAULT NULL COMMENT 'Longitude',
+  `country` char(2) DEFAULT NULL COMMENT '2-letter ISO CC',
+  `region` varchar(1000) DEFAULT NULL COMMENT 'Reported region',
+  `city` varchar(1000) DEFAULT NULL COMMENT 'Reported city',
+  PRIMARY KEY (`bssid`),
+  KEY `IDX_bssids_flags` (`flags`),
+  KEY `IDX_bssids_ts` (`ts`),
+  KEY `IDX_bssids_lat` (`lat`) USING BTREE,
+  KEY `IDX_bssids_lon` (`lon`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+--
+-- RELATIONSHIPS FOR TABLE `bssids`:
+--   `bssid`
+--       `nets` -> `bssid`
+--
+
+-- --------------------------------------------------------
+
+--
 -- Table structure for table `dicts`
 --
 
@@ -142,6 +173,15 @@ CREATE TABLE IF NOT EXISTS `nets` (
 --       `submissions` -> `s_id`
 --
 
+--
+-- Triggers `nets`
+--
+DELIMITER $$
+CREATE TRIGGER `TRG_nets_bssids` AFTER INSERT ON `nets` FOR EACH ROW BEGIN
+    INSERT IGNORE INTO bssids(bssid, ts) VALUES(NEW.bssid, NEW.ts);
+END
+$$
+DELIMITER ;
 -- --------------------------------------------------------
 
 --
@@ -201,13 +241,16 @@ CREATE TABLE IF NOT EXISTS `submissions` (
 
 CREATE TABLE IF NOT EXISTS `users` (
   `u_id` bigint(15) NOT NULL AUTO_INCREMENT,
-  `userkey` binary(16) NOT NULL,
+  `userkey` binary(16) NOT NULL COMMENT 'User key to access results and API',
+  `linkkey` binary(16) DEFAULT NULL COMMENT 'Confirmation link key',
+  `linkkeyts` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Timestamp of last link sending',
   `mail` varchar(500) CHARACTER SET latin1 COLLATE latin1_general_ci DEFAULT NULL,
   `ip` int(10) UNSIGNED NOT NULL,
   `ts` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`u_id`),
   UNIQUE KEY `IDX_users_userkey` (`userkey`),
-  UNIQUE KEY `IDX_users_mail` (`mail`)
+  UNIQUE KEY `IDX_users_mail` (`mail`),
+  UNIQUE KEY `IDX_users_linkkey` (`linkkey`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 --
@@ -219,6 +262,12 @@ CREATE TABLE IF NOT EXISTS `users` (
 --
 -- Constraints for dumped tables
 --
+
+--
+-- Constraints for table `bssids`
+--
+ALTER TABLE `bssids`
+  ADD CONSTRAINT `FK_bssids_nets_bssid` FOREIGN KEY (`bssid`) REFERENCES `nets` (`bssid`);
 
 --
 -- Constraints for table `n2d`

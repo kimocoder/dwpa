@@ -41,7 +41,7 @@ try:
 except NameError:
     userinput = input
 
-#configuration
+# configuration
 conf = {
     'base_url': 'https://wpa-sec.stanev.org/',
     'res_file': 'help_crack.res',
@@ -498,7 +498,6 @@ class HelpCrack(object):
                 dpath = part['dpath']
             if 'dicts' in part:
                 for dpart in part['dicts']:
-                    #print(dpart)
                     dicts.append({'dhash': dpart['dhash'], 'dpath': dpart['dpath']})
         if dhash != '' and dpath != '':
             dicts.append({'dhash': dhash, 'dpath': dpath})
@@ -625,7 +624,7 @@ class HelpCrack(object):
         return None
 
     def run_cracker(self, dictlist, disablestdout=False):
-        '''run externel cracker process'''
+        '''run external cracker process'''
         fd = None
         if disablestdout:
             fd = open(os.devnull, 'w')
@@ -635,7 +634,7 @@ class HelpCrack(object):
                 # TODO: fix this code duplication
                 if self.conf['format'] == 'hccapx':
                     if os.path.exists(self.conf['pmkid_file']):
-                        cracker = '{0} -m16800 --logfile-disable --potfile-disable {1} -o{2} {3}'.format(self.conf['cracker'], self.conf['coptions'], self.conf['key_file'], self.conf['pmkid_file'])
+                        cracker = '{0} -m16800 --advice-disable --logfile-disable --potfile-disable {1} -o{2} {3}'.format(self.conf['cracker'], self.conf['coptions'], self.conf['key_file'], self.conf['pmkid_file'])
                         for dn in dictlist:
                             cracker = ''.join([cracker, ' ', dn])
                         rc = subprocess.call(shlex.split(cracker), stdout=fd)
@@ -649,7 +648,7 @@ class HelpCrack(object):
                             exit(1)
 
                     if os.path.exists(self.conf['hccapx_file']):
-                        cracker = '{0} -m2500 --nonce-error-corrections=128 --logfile-disable --potfile-disable {1} -o{2} {3}'.format(self.conf['cracker'], self.conf['coptions'], self.conf['key_file'], self.conf['hccapx_file'])
+                        cracker = '{0} -m2500 --nonce-error-corrections=128 --advice-disable --logfile-disable --potfile-disable {1} -o{2} {3}'.format(self.conf['cracker'], self.conf['coptions'], self.conf['key_file'], self.conf['hccapx_file'])
                         for dn in dictlist:
                             cracker = ''.join([cracker, ' ', dn])
                         rc = subprocess.call(shlex.split(cracker), stdout=fd)
@@ -756,6 +755,25 @@ class HelpCrack(object):
 
             return False
 
+        def parse_hashcat_combined(pot):
+            '''parse hashcat combined potfile line'''
+            try:
+                arr = pot.split(b':', 3)
+                if len(arr[0]) != 12:
+                    raise ValueError
+                bssid = arr[0]
+                bssid = bssid[0:2] + \
+                    b':' + bssid[2:4] + \
+                    b':' + bssid[4:6] + \
+                    b':' + bssid[6:8] + \
+                    b':' + bssid[8:10] + \
+                    b':' + bssid[10:12]
+                return {'bssid': bssid, 'key': arr[3].rstrip(b'\r\n')}
+            except (TypeError, ValueError, KeyError, IndexError):
+                pass
+
+            return False
+
         res = []
         try:
             if os.path.exists(self.conf['key_file']):
@@ -769,10 +787,15 @@ class HelpCrack(object):
                         if self.conf['potfile'] and not \
                             (b'76c6eaf116d91cc1450561b00c98ea19' in line
                              or b'55vZsj9E.0P59YY.N3gTO2cZNi6GNj2XewC4n3RjKH' in line
-                             or b'8ac36b891edca8eef49094b1afe061acd0*1c7ee5e2f2d0' in line):
+                             or b'8ac36b891edca8eef49094b1afe061acd0*1c7ee5e2f2d0' in line
+                             or b'1c7ee5e2f2d0:0026c72e4900:dlink:aaaa1234' in line):
                             with open(self.conf['potfile'], 'ab') as fdpot:
                                 fdpot.write(line)
 
+                        keypair = parse_hashcat_combined(line)
+                        if keypair:
+                            res.append(keypair)
+                            continue
                         keypair = parse_hashcat(line)
                         if keypair:
                             res.append(keypair)

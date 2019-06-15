@@ -1,28 +1,23 @@
 <?php
 require('conf.php');
-//Check for submission from besside-ng
+// Check for direct submission from besside-ng
 if (isset($_FILES['file'])) {
     require('db.php');
     require('common.php');
-    $status = submission($mysql, $_FILES['file']['tmp_name']);
+    $status = @submission($mysql, $_FILES['file']['tmp_name']);
     $mysql->close();
-
-    if ($status === True) {
-        echo 2;
-    } else {
-        echo $status;
-    }
-
-    exit;
+    echo $status;
+    die();
 }
 
-//User key actions
-$rec_valid = false;
+// User key actions
+$rec_valid = False;
+$mess = False;
 if (isset($_POST['g-recaptcha-response'])) {
-    //Check reCAPTCHA
+    // check reCAPTCHA
     $handle = curl_init('https://www.google.com/recaptcha/api/siteverify');
     $options = array(
-        CURLOPT_POST => true,
+        CURLOPT_POST => True,
         CURLOPT_POSTFIELDS => http_build_query(array(
             'secret' => $privatekey,
             'response' => $_POST['g-recaptcha-response'],
@@ -31,66 +26,93 @@ if (isset($_POST['g-recaptcha-response'])) {
         CURLOPT_HTTPHEADER => array(
             'Content-Type: application/x-www-form-urlencoded'
         ),
-        CURLINFO_HEADER_OUT => false,
-        CURLOPT_HEADER => false,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_SSL_VERIFYPEER => true
+        CURLINFO_HEADER_OUT => False,
+        CURLOPT_HEADER => False,
+        CURLOPT_RETURNTRANSFER => True,
+        CURLOPT_SSL_VERIFYPEER => True
     );
     curl_setopt_array($handle, $options);
     $response = curl_exec($handle);
     curl_close($handle);
 
-    //Validate reCAPTCHA response
-    $responseData = json_decode($response, true);
-    if (isset($responseData['success']) && $responseData['success'] == true) {
-        $rec_valid = true;
+    // validate reCAPTCHA response
+    $responseData = json_decode($response, True);
+    if (isset($responseData['success']) && $responseData['success'] == True) {
+        $rec_valid = True;
     }
 
     if ($rec_valid) {
         require_once('db.php');
         require_once('common.php');
 
-        //if we have email, validate it
-        $mail = Null;
-        if (isset($_POST['mail']) && validEmail($_POST['mail'])) {
+        // validate e-mail
+        $mail = False;
+        if (isset($_POST['mail']) && validEmail(trim($_POST['mail']))) {
             $mail = trim($_POST['mail']);
         }
 
-        //put new key in db
-        $sql = 'INSERT INTO users(userkey, mail, ip) VALUES(UNHEX(?), ?, ?)
-                ON DUPLICATE KEY UPDATE userkey=UNHEX(?), ip=?, ts=CURRENT_TIMESTAMP()';
-        $stmt = $mysql->stmt_init();
-        $ip = ip2long($_SERVER['REMOTE_ADDR']);
-        $userkey = gen_key();
-        $stmt->prepare($sql);
-        $stmt->bind_param('ssisi', $userkey, $mail, $ip, $userkey, $ip);
-        $stmt->execute();
-        $stmt->close();
+        if ($mail) {
+            // put new key in db and send confirmation mail
+            $sql = 'INSERT INTO users(userkey, linkkey, mail, ip) VALUES(UNHEX(?), UNHEX(?), ?, ?)';
+            $stmt = $mysql->stmt_init();
+            $ip = ip2long($_SERVER['REMOTE_ADDR']);
+            $key = gen_key();
+            $stmt->prepare($sql);
+            $stmt->bind_param('sssi', $key, $key, $mail, $ip);
+            $res = $stmt->execute();
+            $stmt->close();
 
-        //set cookie
-        setcookie('key', $userkey, 2147483647, '', '', false, true);
-        $_COOKIE['key'] = $userkey;
-        
-        //send mail with the key
-        if (isset($mail)) {
-            require_once('mail.php');
-            try {
-                $mailer->AddAddress($mail);
-		        $mailer->Subject = 'wpa-sec.stanev.org key';
-		        $mailer->Body    = "Key to access results is: $userkey";
-		        $mailer->Send();
-		        $mailer->SmtpClose();
-		    } catch (Exception $e) { }
+            // if we succeeded the insert
+            if ($res) {
+                // set cookie
+                setcookie('key', $key, 2147483647, '', '', False, True);
+                $_COOKIE['key'] = $key;
+
+                // send mail with the key
+                require_once('mail.php');
+                try {
+                    $mailer->AddAddress($mail);
+                    $mailer->Subject = "{$_SERVER['HTTP_HOST']} key";
+                    $mailer->Body    = "Key to access results is: $key";
+                    $mailer->Send();
+                    $mailer->SmtpClose();
+                } catch (Exception $e) { }
+                $mess = 'User key issued. Make sure you keep it to access the results.';
+            } else {
+                // send key reset confirmation e-mail - once in 24h
+                $sql = 'UPDATE users SET linkkey = UNHEX(?), linkkeyts = CURRENT_TIMESTAMP() WHERE mail = ? AND DATE_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY) > linkkeyts';
+                $stmt = $mysql->stmt_init();
+                $stmt->prepare($sql);
+                $stmt->bind_param('ss', $key, $mail);
+                $res = $stmt->execute();
+                $uc = $stmt->affected_rows;
+                $stmt->close();
+
+                // if update passed, send mail, else user should wait 24h
+                if ($uc == 1) {
+                    require_once('mail.php');
+                    try {
+                        $mailer->AddAddress($mail);
+                        $mailer->Subject = "{$_SERVER['HTTP_HOST']} key change";
+                        $mailer->Body    = "A request for a new user key was submitted. Please follow this link to confirm: {$_SERVER['REQUEST_SCHEME']}://{$_SERVER['HTTP_HOST']}/?get_key=$key";
+                        $mailer->Send();
+                        $mailer->SmtpClose();
+                    } catch (Exception $e) { }
+                    $mess = 'New key request was submitted. Please check you e-mail to confirm.';
+                } else {
+                    $mess = 'User key request was already submitted. Please try again tomorrow.';
+                }
+            }
         }
     }
 }
 
-//validate 32 char key
+// Validate 32 char key
 function valid_key($key) {
     return preg_match('/^[a-f0-9]{32}$/', strtolower($key));
 }
 
-//Set key
+// Set key
 if (isset($_POST['key']) && valid_key($_POST['key'])) {
     require_once('db.php');
     $sql = 'SELECT u_id FROM users WHERE userkey=UNHEX(?)';
@@ -101,26 +123,30 @@ if (isset($_POST['key']) && valid_key($_POST['key'])) {
     $stmt->store_result();
 
     if ($stmt->num_rows == 1) {
-        setcookie('key', $_POST['key'], 2147483647, '', '', false, true);
+        setcookie('key', $_POST['key'], 2147483647, '', '', False, True);
         $_COOKIE['key'] = $_POST['key'];
-    } else
+    } else {
         $_POST['remkey'] = '1';
+    }
     $stmt->close();
+
+    header('Location: /');
+    die();
 }
 
-//Remove key
+// Remove key
 if (isset($_POST['remkey'])) {
-    setcookie('key', '', 1, '', '', false, true);
+    setcookie('key', '', 1, '', '', False, True);
     unset($_COOKIE['key']);
 }
 
-//CMS
+// CMS
 $content = 'content/';
-$keys = array('home', 'get_key', 'my_nets', 'submit', 'nets', 'dicts', 'stats', 'search', 'get_work', 'put_work');
-$keys_if = array('get_work', 'put_work');
+$keys = array('home', 'get_key', 'my_nets', 'submit', 'nets', 'dicts', 'stats', 'search', 'get_work', 'put_work', 'api');
+$keys_if = array('get_work', 'put_work', 'api');
 
 list($key) = each($_GET);
-if (!in_array($key,$keys)) {
+if (!in_array($key, $keys)) {
 	$key = 'home';
 }
 
@@ -186,7 +212,7 @@ else
 
 <div id="footer">
 <div class="hr"><hr /></div>
-Contact: alex at stanev dot org
+Contact: alex at stanev dot org Twitter:<a href="https://twitter.com/RealEnderSec">@RealEnderSec</a>
 </div>
 
 </div>
