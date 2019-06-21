@@ -1,18 +1,24 @@
 <?php
-//DB Configuration
-$cfg_db_host='';
-$cfg_db_user='';
-$cfg_db_pass='';
-$cfg_db_name='';
+// DB Configuration
+$cfg_db_host = '';
+$cfg_db_user = '';
+$cfg_db_pass = '';
+$cfg_db_name = '';
 
-//reCaptcha auth
-$publickey = '';
+// reCaptcha auth
+$publickey  = '';
 $privatekey = '';
 
-//bosskey
+// Bosskey
 $bosskey = '';
 
-//App specific defines
+// 3wifi API key
+$wifi3apikey = '';
+
+// wigle API key
+$wigleapikey = '';
+
+// App specific defines
 define('HCXPCAPTOOL', '/var/www/wpa-sec/cap/hcxpcaptool');
 define('RKG', '/var/www/wpa-sec/cap/routerkeygen-cli');
 
