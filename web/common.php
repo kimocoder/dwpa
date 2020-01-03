@@ -1,6 +1,10 @@
 <?php
 // Implements hashcat $HEX[]
 function hc_unhex($key) {
+    if (strlen($key) <= 6) {
+        return $key;
+    }
+
     $k = substr($key, 5, -1);
     if (( (bool) (~ strlen($k) & 1)) &&
         (0 === substr_compare($key, '$HEX[', 0, 5)) &&
@@ -8,6 +12,13 @@ function hc_unhex($key) {
         (ctype_xdigit($k))) {
 
         return hex2bin($k);
+    }
+
+    if ( ($k == '') &&
+        (0 === substr_compare($key, '$HEX[', 0, 5)) &&
+        (0 === substr_compare($key, ']', -1))) {
+
+        return '';
     }
 
     return $key;
@@ -116,7 +127,7 @@ function omac1_aes_128($data, $key) {
     } __attribute__((packed));
 */
 
-function check_key_hccapx($hccapx, $keys, $nc=32767, $pmk=False) {
+function check_key_hccapx($hccapx, $keys, $nc=512, $pmk=False) {
     if (strlen($hccapx) != 393)
         return False;
 
@@ -411,7 +422,7 @@ function submission($mysql, $file) {
     $pmkidfile = tempnam(SHM, 'pmkid');
     $res = '';
     $rc  = 0;
-    exec(HCXPCAPTOOL." --nonce-error-corrections=128 --time-error-corrections=10000 -o $hccapxfile -z $pmkidfile $file 2>&1", $res, $rc);
+    exec(HCXPCAPTOOL." --time-error-corrections=10000 --ignore-fake-frames --ignore-zeroed-pmks --ignore-replaycount --ignore-mac -o $hccapxfile -z $pmkidfile $file 2>&1", $res, $rc);
 
     // do we have error condition?
     if ($rc != 0) {
@@ -565,7 +576,7 @@ function submission($mysql, $file) {
             if ($keyver == 100) {
                 $reshs = check_key_pmkid($net[1], array(''), $zpmk);
             } else {
-                $reshs = check_key_hccapx($net[1], array(''), 128*2, $zpmk);
+                $reshs = check_key_hccapx($net[1], array(''), 8, $zpmk);
             }
             if ($reshs) {
                 // this is zeroed PMK
@@ -583,7 +594,7 @@ function submission($mysql, $file) {
                     if ($keyver == 100) {
                         $reshs = check_key_pmkid($net[1], array($hs['pass']), $hs['pmk']);
                     } else {
-                        $reshs = check_key_hccapx($net[1], array($hs['pass']), abs($hs['nc'])*2+128, $hs['pmk']);
+                        $reshs = check_key_hccapx($net[1], array($hs['pass']), abs($hs['nc'])*2+1, $hs['pmk']);
                     }
                     if ($reshs) {
                         // we cracked that by PMK, now let's check if essid matches
@@ -676,7 +687,7 @@ function submission($mysql, $file) {
 
     // update handshake stats
     $mysql->query("UPDATE stats SET pvalue = (SELECT count(net_id) FROM nets) WHERE pname='nets'");
-    $mysql->query("UPDATE stats SET pvalue = (SELECT count(DISTINCT bssid) FROM nets) WHERE pname='nets_unc'");
+    $mysql->query("UPDATE stats SET pvalue = (SELECT count(1) FROM bssids) WHERE pname='nets_unc'");
     $mysql->query("UPDATE stats SET pvalue = (SELECT count(net_id) FROM nets WHERE keyver=100) WHERE pname='pmkid'");
     $mysql->query("UPDATE stats SET pvalue = (SELECT count(DISTINCT bssid) FROM nets WHERE keyver=100) WHERE pname='pmkid_unc'");
 
@@ -759,6 +770,8 @@ function delete_from_n2d(& $mysql, & $stmt, $net_id) {
 // Deletes from rkg, n2u, n2d, and nets by net_id
 // This is used to remove handshakes/PMKIDs with broken essids
 function delete_cascade_by_net_id(& $mysql, $net_id) {
+    $mysql->begin_transaction(MYSQLI_TRANS_START_READ_WRITE);
+
     $stmt = $mysql->stmt_init();
     $stmt->prepare('DELETE FROM rkg WHERE net_id=?');
     $stmt->bind_param('i', $net_id);
@@ -785,7 +798,7 @@ function delete_cascade_by_net_id(& $mysql, $net_id) {
     $stmt->fetch();
     $stmt->close();
     // delete from bssids if we have only one such net
-    if (n_count == 1) {
+    if ($n_count == 1) {
         $stmt = $mysql->stmt_init();
         $stmt->prepare('DELETE FROM bssids WHERE bssid = (SELECT bssid FROM nets WHERE net_id=?)');
         $stmt->bind_param('i', $net_id);
@@ -797,6 +810,8 @@ function delete_cascade_by_net_id(& $mysql, $net_id) {
     $stmt->bind_param('i', $net_id);
     $stmt->execute();
     $stmt->close();
+
+    $mysql->commit();
 
     return;
 }
@@ -917,7 +932,7 @@ ORDER BY count(pass) DESC");
     $stmt->bind_result($key);
 
     // write compressed wordlist
-    $wpakeys = tempnam(SHM, 'wpakeys');
+    $wpakeys = tempnam(CAP, 'wpakeys');
     chmod($wpakeys, 0644);
     $fd = gzopen($wpakeys, 'wb9');
     while ($stmt->fetch()) {
